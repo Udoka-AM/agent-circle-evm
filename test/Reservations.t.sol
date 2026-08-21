@@ -397,18 +397,29 @@ contract ReservationsTest is Test {
         assertTrue(vault.isOrderAuthorised(ORDER_A));
     }
 
-    /// A withdrawal is never blocked by a reservation — the trader's authority over their
-    /// own money outranks an agent's outstanding order. The order simply stops being
-    /// authorised, which is where the safety comes from.
-    function test_traderWithdrawalIsNotBlockedAndUnauthorisesTheOrder() public {
+    /// A reservation gates a withdrawal, because it is backed by a real allowance the
+    /// settlement spender can act on. See CrossVaultIsolation.t.sol for what goes wrong
+    /// without this. The trader is not trapped: cancelling is theirs to do alone.
+    function test_reservedCapitalIsNotWithdrawable() public {
         _authorise(ORDER_A, 1_000 * UNIT);
+        assertEq(vault.availableIdle(id), 9_000 * UNIT);
 
         vm.prank(trader);
+        vm.expectRevert(Errors.InsufficientBalance.selector);
         vault.withdraw(id, 9_500 * UNIT);
 
-        assertEq(usdc.balanceOf(trader), 99_500 * UNIT, "withdrawal must go through");
+        vm.prank(trader);
+        vault.withdraw(id, 9_000 * UNIT);
+
+        // What must hold is that the standing allowance is still fully backed by tokens
+        // this vault actually owns — never by another vault's balance.
         assertEq(vault.availableIdle(id), 0);
-        assertFalse(vault.isOrderAuthorised(ORDER_A), "unfunded order cannot settle");
+        assertEq(usdc.allowance(address(vault), address(venue)), 1_000 * UNIT);
+        assertEq(_reserved(), 1_000 * UNIT, "allowance and backing move together");
+
+        // The order itself is now outside the position cap, because the trader shrank the
+        // vault around it — so it is refused at settlement too. Both guards, independently.
+        assertFalse(vault.isOrderAuthorised(ORDER_A));
     }
 
     function test_suspendingTheListingStopsAnOutstandingOrder() public {

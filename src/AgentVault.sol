@@ -182,15 +182,18 @@ contract AgentVault is ReentrancyGuard {
         _assessFees(id);
 
         Vault storage v = vaults[id];
-        // Against raw idle, deliberately *not* against idle minus reservations. A
-        // trader's authority over their own money outranks an agent's outstanding order,
-        // and no reservation may become a lock on a withdrawal.
+        // Against *available* idle, not raw idle. A reservation is no longer pure
+        // accounting: since the allowance mirror was added it grants a real, standing
+        // permission for the settlement spender to pull that amount. This contract pools
+        // every vault's tokens, so a trader who withdrew their own backing while leaving
+        // that permission live would let their order settle out of somebody else's
+        // balance. `isOrderAuthorised` cannot save us here — a preapproved order never
+        // asks it, and the token does not consult it either.
         //
-        // That is safe because a reservation grants no allowance to anybody. It is pure
-        // accounting, so a withdrawal cannot let an order settle out of another vault's
-        // balance — it simply leaves the order unfunded, and `isOrderAuthorised` then
-        // refuses it at settlement. Safety comes from the refusal, not from the lock.
-        if (amount > v.idle) revert Errors.InsufficientBalance();
+        // This cannot trap anyone. Orders live at most `MAX_ORDER_LIFETIME`, and the
+        // trader can `cancelOrder` or `cancelOrders` any reservation on their own vault,
+        // so a full withdrawal is always one transaction away and never needs the agent.
+        if (amount > _availableIdle(v)) revert Errors.InsufficientBalance();
 
         HighWaterMark.State memory s =
             HighWaterMark.State({ balance: v.idle, highWaterMark: v.highWaterMark });
@@ -606,7 +609,10 @@ contract AgentVault is ReentrancyGuard {
         // reverting matters because `withdraw` assesses fees first, and a revert here would
         // let an unpayable fee block a trader from reaching their own money — the one
         // outcome this contract must never produce.
-        if (split.total > v.idle) return;
+        // Payable from *available* idle only, for the same reason a withdrawal is: a fee
+        // taken out of capital backing a live order would settle that order from another
+        // vault's balance.
+        if (split.total > _availableIdle(v)) return;
 
         v.highWaterMark = s.highWaterMark;
         v.idle -= split.total;
