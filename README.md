@@ -328,7 +328,10 @@ What is still genuinely open is per-vault attribution of an order-book settlemen
 the exchange pulls from the pooled balance, no vault's `idle` decreases, because the
 vault is not in that transaction. The aggregate stays solvent — every live reservation
 is backed by its own vault's idle — but reconciling a settled fill back to the vault
-that caused it needs a settlement notification, and that is not designed yet.
+that caused it needs a settlement notification. The exchange hardcodes `order.maker` as
+both the source of collateral and the destination for outcome tokens, so a singleton
+vault cannot express whose position is whose — see
+[ADR-0001](docs/adr/0001-vault-topology.md), which proposes per-vault clones.
 
 ### What is not built, and why
 
@@ -371,6 +374,8 @@ test/
 script/
   Deploy.s.sol                real deployment
   DeployLocal.s.sol           local chain harness
+docs/
+  adr/0001-vault-topology.md  singleton vs per-vault clones; open decision
 ```
 
 ---
