@@ -8,3 +8,7 @@ docs/book/
 .env.*
 !.env.example
 .DS_Store
+
+# Internal working notes. Plain-language running record of the build, its decisions,
+# and its open problems. Not for publication.
+details.md
