@@ -37,6 +37,19 @@ contract MockVenueAdapter is IVenueAdapter {
         return "";
     }
 
+    /// The permission-free exit. Hands back the position's marked value with no operator
+    /// and no allowance from the vault — the adapter pushes, it never pulls.
+    ///
+    /// data = abi.encode(portionBps): 10_000 closes the whole position, less closes part,
+    /// which is how a partial exit and a resolved-market redemption both look from here.
+    function exit(address vault, bytes32 id, bytes calldata data) external returns (uint256) {
+        uint256 portionBps = abi.decode(data, (uint256));
+        uint256 payout = (positions[id] * portionBps) / 10_000;
+        positions[id] -= payout;
+        if (payout > 0) token.transfer(vault, payout);
+        return payout;
+    }
+
     /// Simulate a position moving after the fact.
     function setPositionValue(bytes32 id, uint256 value) external {
         positions[id] = value;
@@ -46,6 +59,11 @@ contract MockVenueAdapter is IVenueAdapter {
     function settle(address vault, bytes32 id, uint256 amount) external {
         positions[id] = 0;
         token.transfer(vault, amount);
+    }
+
+    /// Settles atomically, so it pulls for itself.
+    function settlementSpender() external view returns (address) {
+        return address(this);
     }
 
     function positionValue(address, bytes32 id) external view returns (uint256) {
@@ -69,6 +87,52 @@ contract GreedyVenueAdapter is IVenueAdapter {
         uint256 grab = abi.decode(data, (uint256));
         token.transferFrom(vault, address(this), grab);
         return "";
+    }
+
+    /// Treats an "exit" as another chance to pull from the vault. The vault grants no
+    /// allowance here, so this reverts — and would be caught by the balance check even if
+    /// an allowance were somehow left standing.
+    function exit(address vault, bytes32, bytes calldata data) external returns (uint256) {
+        uint256 grab = abi.decode(data, (uint256));
+        token.transferFrom(vault, address(this), grab);
+        return 0;
+    }
+
+    function settlementSpender() external view returns (address) {
+        return address(this);
+    }
+
+    function positionValue(address, bytes32) external pure returns (uint256) {
+        return 0;
+    }
+
+    function quoteToken() external view returns (address) {
+        return address(token);
+    }
+}
+
+/// An order-book venue: the adapter never settles anything itself, and the address that
+/// pulls quote tokens is a separate exchange the vault does not control. This is the shape
+/// the Polymarket route actually has, and the reason `settlementSpender` exists.
+contract BookVenueAdapter is IVenueAdapter {
+    IERC20 public immutable token;
+    address public immutable exchange;
+
+    constructor(address token_, address exchange_) {
+        token = IERC20(token_);
+        exchange = exchange_;
+    }
+
+    function execute(address, bytes calldata) external pure returns (bytes memory) {
+        revert("entry is via the book, not here");
+    }
+
+    function exit(address, bytes32, bytes calldata) external pure returns (uint256) {
+        return 0;
+    }
+
+    function settlementSpender() external view returns (address) {
+        return exchange;
     }
 
     function positionValue(address, bytes32) external pure returns (uint256) {

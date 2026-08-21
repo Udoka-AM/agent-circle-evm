@@ -17,7 +17,9 @@ gas:
 	forge snapshot --check || forge snapshot
 
 coverage:
-	forge coverage --no-match-coverage "(test|script)"
+	# --ir-minimum because coverage disables the optimizer, and the generated getter for
+	# the twelve-field Vault struct goes stack-too-deep without it.
+	forge coverage --ir-minimum --no-match-coverage "(test|script)"
 
 fmt:
 	forge fmt

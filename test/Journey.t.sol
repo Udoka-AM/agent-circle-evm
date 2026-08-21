@@ -154,7 +154,7 @@ contract JourneyTest is Test {
         usdc.mint(address(venue), 1_000 * UNIT);
         vm.prank(agent);
         vault.executeTrade(id, address(venue), 0, abi.encode(id, uint256(0), uint256(0)));
-        (,, uint256 idle,,,,,,,) = vault.vaults(id);
+        (,, uint256 idle,,,,,,,,,) = vault.vaults(id);
         vm.prank(trader);
         vault.withdraw(id, idle);
         console2.log("  trader walked away with:", _usd(usdc.balanceOf(trader)));

@@ -180,12 +180,12 @@ contract AgentVaultTest is Test {
         // Still inside the 1500bps limit.
         venue.setPositionValue(id, 0);
         _trade(0, 0);
-        (,,,,,,,, AgentVault.VaultStatus status,) = vault.vaults(id);
+        (,,,,,,,,, AgentVault.VaultStatus status,,) = vault.vaults(id);
         assertEq(uint256(status), uint256(AgentVault.VaultStatus.Active), "1000bps is allowed");
 
         // Deeper loss: idle 9,000 with a further 500 gone takes it past 1500bps.
         _trade(900 * UNIT, 0); // spends 900 into a position worth 0 → value 8,100
-        (,,,,,,,, status,) = vault.vaults(id);
+        (,,,,,,,,, status,,) = vault.vaults(id);
         assertEq(uint256(status), uint256(AgentVault.VaultStatus.Paused), "1900bps trips");
 
         // Only the trader can resume.
@@ -216,7 +216,7 @@ contract AgentVaultTest is Test {
 
         vm.prank(t2);
         bytes32 strict = vault.openVault(listingId, 500, 500);
-        (,,,,, uint16 cap, uint16 dd,,,) = vault.vaults(strict);
+        (,,,,,, uint16 cap, uint16 dd,,,,) = vault.vaults(strict);
         assertEq(cap, 500);
         assertEq(dd, 500);
     }
@@ -229,7 +229,7 @@ contract AgentVaultTest is Test {
         vault.tightenRiskLimits(id, 600, 800);
         vm.stopPrank();
 
-        (,,,,, uint16 cap, uint16 dd,,,) = vault.vaults(id);
+        (,,,,,, uint16 cap, uint16 dd,,,,) = vault.vaults(id);
         assertEq(cap, 600);
         assertEq(dd, 800);
     }

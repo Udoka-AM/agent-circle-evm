@@ -11,6 +11,7 @@ library Errors {
     error NotGovernance();
     error NotGuardian();
     error NotVault();
+    error NotTraderOrAgent();
 
     // ── lifecycle
     error VaultNotActive();
@@ -35,6 +36,14 @@ library Errors {
     error NoUnbondRequested();
     error UnbondPeriodNotElapsed();
     error UnbondAmountExceedsBond();
+
+    // ── orders
+    error OrderAlreadyExists();
+    error OrderNotFound();
+    error OrderExpired();
+    error OrderNotExpired();
+    error OrderLifetimeTooLong();
+    error TooManyOpenOrders();
 
     // ── venue
     error VenueNotWhitelisted();

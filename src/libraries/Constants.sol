@@ -32,4 +32,22 @@ library Constants {
     uint64 internal constant MAX_UNBOND_PERIOD = 90 days;
     uint64 internal constant FEE_ASSESSMENT_INTERVAL = 7 days;
     uint64 internal constant VENUE_TIMELOCK_DELAY = 2 days;
+
+    /// Longest an authorised-but-unsettled order may sit on a venue's book.
+    ///
+    /// A reservation cannot be decremented as fills arrive — a settlement-time signature
+    /// check may only read state, never write it — so every authorised order holds its
+    /// full worst-case cost until it expires or is cancelled. Short lifetimes are how
+    /// that imprecision is kept cheap, and they also bound how stale the state behind a
+    /// signature can be.
+    uint64 internal constant MAX_ORDER_LIFETIME = 1 hours;
+
+    /// Most orders one vault may have outstanding at once.
+    ///
+    /// A reservation holds a trader's capital until it is cancelled or expires, and there
+    /// is no floor on an order's size — so without this an agent could authorise ten
+    /// thousand one-wei orders and leave the trader's exit gated on clearing them all.
+    /// The bound is what makes `cancelOrders` a single affordable transaction, and it is
+    /// the difference between a reservation being an inconvenience and being a lock.
+    uint8 internal constant MAX_OPEN_ORDERS = 8;
 }

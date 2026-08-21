@@ -6,8 +6,14 @@ Solidity for Polygon.
 Developers list self-built, self-hosted agents. Traders allocate capital those agents
 trade on their behalf. Custody never transfers: the trader is the sole withdrawal
 authority, the agent holds only scoped permission to trade, and position caps and
-drawdown limits are enforced in the same transaction as the trade rather than monitored
-after it.
+drawdown limits are enforced by the contract rather than monitored after the fact.
+
+Where a venue settles atomically, those limits hold in the same transaction as the trade.
+Where it does not — an order book matching signed orders and settling them later —
+they are enforced when the order is authorised and re-checked when it settles, and an
+order
+that would breach a trader's limits cannot settle. §4 is why that distinction exists and
+what is still unresolved about it.
 
 ```bash
 make journey
@@ -22,13 +28,13 @@ the fastest way to see what this does.
 
 | | |
 |---|---|
-| Tests | 51 passing |
-| Line coverage | 95% (`HighWaterMark` and `VenueWhitelist` at 100%) |
+| Tests | 86 passing |
+| Line coverage | 96% (`HighWaterMark` and `VenueWhitelist` at 100%) |
 | Local deployment | Verified — contracts deployed and the full journey driven against a live node |
 | Testnet | Not yet deployed to Amoy |
 | Audit | Not started |
 
-Branch coverage is 45%, and that number is honest: most unexercised branches are revert
+Branch coverage is 51%, and that number is honest: most unexercised branches are revert
 paths on parameter validation. Worth closing before an audit, not before a conversation.
 
 ---
@@ -68,6 +74,18 @@ bracketed by six checks that all hold in the same transaction:
 Checks 5 and 6 are **post-conditions**. Rather than predicting what a venue call will do,
 the vault performs it and asserts the resulting state is legal, reverting everything if
 not. Prediction is fragile against venues we do not control; assertion is not.
+
+For venues that cannot settle atomically, the same limits are carried by two further
+entry points, described in §4:
+
+- `authoriseOrder` reserves an order's worst-case cost before it is signed, and counts
+  every outstanding order against the position cap as though it had already filled.
+  Reserved capital is not withdrawable while the order is live, it is mirrored by an
+  allowance to whoever actually settles so a cancelled order cannot be pulled, and
+  `isOrderAuthorised` re-checks the whole thing against live state at settlement.
+- `exitPosition` leaves a position with no third party involved. It is the one path that
+  works while the vault is paused and after governance has removed the venue, because
+  stopping new money going in must never strand money already there.
 
 **`HighWaterMark`** — fee accounting, and the part most worth reading.
 
@@ -137,32 +155,194 @@ made by whoever holds the multisig.
 
 ---
 
-## 4. The open question: how does a Polymarket trade settle?
+## 4. The open question: how does an order-book trade settle?
 
-**Unresolved, and the one thing that could force a redesign.**
+**Still unresolved, but narrower than it looks, and most of the answer is now built.**
 
 Polymarket's CTF Exchange matches signed orders off-chain and settles them later. If a
-vault signs an order, funds move in a transaction we do not control and cannot attach
-post-conditions to. That breaks "limits enforced atomically, in the same transaction as
-the trade," which is the sentence this product rests on.
+vault signs an order, the money moves in a transaction this contract is not part of and
+cannot attach post-conditions to. `executeTrade` is unavailable there.
 
-Possible resolutions, in order of preference:
+### This is not a Polygon problem
 
-1. **Vault as taker.** Call `fillOrder` directly against a resting order. Atomic, and the
-   post-conditions hold. Costs the maker rebate and needs a counterparty order to exist
-   at an acceptable price.
-2. **Bounded pre-authorisation.** Sign only orders whose worst-case fill is provably
-   inside the limits. Weaker — enforces at signing rather than settlement, and stale
-   orders are a real hazard.
-3. **Operator-side enforcement.** Rejected. Puts the guarantee in someone else's process.
+Worth stating early, because it changes how the rest of this section should be read.
 
-`IVenueAdapter.execute` is documented to require atomicity precisely so this cannot be
-quietly compromised. An adapter that merely queues an order does not satisfy the
-interface and must not be whitelisted.
+On 21 August 2026 Jupiter's developer relations confirmed publicly that Jupiter Predict
+is settled by off-chain keepers, and that a Solana program "will not be compatible" with
+opening positions there — for bridged and native providers alike.
 
-**No Polymarket adapter is written yet, on purpose.** `src/adapters/` does not exist
-because a half-designed adapter would be the most expensive thing in this repository.
-This is the first thing to resolve with anyone from the Polymarket or Polygon side.
+Two candidate venues, two different chains, same shape. Losing atomicity is a property
+of order books with off-chain matching, not of the EVM, so the design below is required
+on whichever chain this ships to rather than being a Polygon workaround. What differs is
+only the mechanism in the middle row of the table below: the EVM has a documented
+standard for asking a contract to vouch for its own signature, and whether Solana offers
+an equivalent hook is the question currently outstanding with Jupiter.
+
+The original framing — "we lose atomicity, so we lose the guarantee" — was too
+pessimistic. There are three places a rule can be enforced, and only one of them is lost:
+
+| Where the rule is checked | Available to us |
+|---|---|
+| After the trade, in our transaction | No — the settlement is not ours |
+| During settlement, inside their transaction | Yes, but see the complication below |
+| Before the order is ever signed | Yes, always |
+
+The middle row is the useful part. To settle an order signed by a contract, an exchange
+has to ask that contract to confirm the signature is genuine — and it asks *inside its
+own settlement transaction*. A vault that answers no makes the settlement fail. That is
+not checking afterwards; it is refusing at the door, and for safety purposes the two are
+close.
+
+### What is built
+
+**Reservation up front.** `authoriseOrder` moves no money and books the order's full
+worst-case cost as spent immediately. An order is authorised only if the vault would
+still be inside its position cap assuming that order and every other outstanding one
+fills completely at the worst price the agent named. This wastes some capital
+efficiency, and that is the correct direction to be wrong in — the alternative is three
+orders that each pass the cap alone and breach it together. Reservations and atomic
+trades draw on one budget, so the two paths cannot be played against each other.
+
+**The signature is the enforcement.** `isOrderAuthorised` re-evaluates an outstanding
+order against live state: the vault still active, the listing still live, the venue still
+whitelisted, the money still there, the cap still holding at current marks. An order
+resting on a book for an hour cannot settle if the trader has since paused the vault or
+withdrawn behind it. It is a `view` because the exchange asks inside a `staticcall` —
+which is also why a reservation is held at full worst case and released only by expiry or
+cancellation, never decremented as fills arrive.
+
+**An exit that needs nobody's permission.** Closing a position and redeeming a resolved
+market are both direct contract calls; only *entering* needs the order book. So
+`IVenueAdapter.exit` and `AgentVault.exitPosition` bypass the exchange entirely. The
+trader can call it without the agent, it works while the vault is paused or closing, and
+it works after the venue has been de-whitelisted. Given that dependence on an operator is
+the entire problem, the escape route being operator-free matters more than the entrance
+being efficient.
+
+**A reservation gates a withdrawal, and cannot trap anyone.** Reserved capital is not
+withdrawable, because this contract pools every vault's tokens: letting a trader take
+capital an outstanding order still depends on would mean that order settling out of
+somebody else's balance. That safety does not depend on the unbuilt signature mechanism,
+which is the point of doing it this way.
+
+The obvious objection is that it hands the agent a lever over the trader's own money. It
+does not. The trader can cancel any reservation on their own vault unilaterally, and
+`cancelOrders` clears every one of them in a single transaction. Orders also expire
+within the hour on their own, and an agent may hold at most `MAX_OPEN_ORDERS` open at
+once — so there is no way to bury a trader's capital under a heap of tiny reservations
+and make clearing them the expensive part. A full withdrawal is always one transaction
+away and never needs the agent's cooperation.
+
+### What honestly weakens
+
+Two things, and they belong in any technical conversation about this.
+
+An authorised order can fill in pieces, and the settlement-time check may only read
+state, not update a counter. So the vault cannot track fills as they happen. It
+compensates by authorising small orders with short lifetimes, capped at one hour in
+`Constants.sol`, and by assuming a full fill in the reservation. The limit still holds;
+the vault just cannot be more precise than the order it signed.
+
+And the public claim changes. Not from safe to unsafe, but from *"limits enforced in the
+same transaction as the trade"* to *"limits enforced when the order is authorised and
+re-checked when it settles; an order that would breach a trader's limits cannot settle."*
+Still unusual, still strong, and defensible in a technical conversation — which the
+first version would not have been.
+
+### What the exchange actually does — answered from the deployed code
+
+The three questions this section used to leave open are mostly settled. They did not
+need a conversation: the CTF Exchange is open source and verified on Polygon, so the
+answers were readable. Checked against **V2 at
+`0xE111180000d2663C0091e4f400237545B87B996B`**, the live exchange as of August 2026,
+audited by Quantstamp and Cantina in March 2026.
+
+**1. Does the exchange accept a smart contract as an order signer? — Yes.** The
+load-bearing question, and it comes back in our favour. `SignatureType.POLY_1271` routes
+to `_verifyPoly1271Signature`, which requires `signer == maker`, requires the maker to
+have code, and then calls Solady's `SignatureCheckerLib.isValidSignatureNow(maker,
+...)`. That is EIP-1271 against an arbitrary contract — contract signers are *not*
+restricted to Polymarket-derived proxy or Safe addresses, unlike `POLY_PROXY` and
+`POLY_GNOSIS_SAFE`, which recompute an expected address from an EOA. A vault can be the
+maker and signer of its own orders. The middle row of that table is real.
+
+**2. Who may settle orders? — Operators only, and the old answer here was wrong.** V1
+gated `fillOrder`, `fillOrders` and `matchOrders` behind `onlyOperator notPaused`. V2
+removed `fillOrder` and `fillOrders` entirely in favour of a single `matchOrders`, still
+operator-gated. "Vault as taker, calling `fillOrder` directly against a resting order" —
+which an earlier version of this section ranked as the *preferred* resolution — is not
+merely disfavoured. That function no longer exists, and was never callable by us when it
+did.
+
+**3. Could we run our own settlement operator for our own flow? — Still open, and now the
+question that matters most.** See below for why.
+
+### The complication, and it is a real one
+
+V2 added order preapproval, and it punctures the settlement-time guarantee.
+`validateOrderSignature` short-circuits: an order submitted with an empty signature is
+checked only against a `preapproved[orderHash]` mapping, and never triggers the EIP-1271
+call at all.
+
+This is not a hole in Polymarket. `_preapproveOrder` verifies the signature properly —
+including asking our vault — before recording anything, so nothing can be forged. But the
+consequence for us is sharp: **our vault is asked once, at preapproval, and the answer is
+cached.** Subsequent matches never ask again. `preapproveOrder` and
+`invalidatePreapprovedOrder` are both `onlyOperator`, so the maker cannot revoke its own
+preapproval. An operator can preapprove while a vault says yes and settle later, when it
+would say no — the vault paused, the money withdrawn, the cap breached in between.
+
+Worse for the stale-order case, we could not find an on-chain `expiration` check in V2's
+match path at all; it appears to be enforced off-chain by the operator. That wants direct
+confirmation before anything is built on it, but if it holds, `MAX_ORDER_LIFETIME` bounds
+what *our* contract will authorise and bounds nothing about when a signed order may
+actually settle.
+
+**What this vindicates.** The reservation accounting, not the signature check, is the
+load-bearing safety property — and gating withdrawals on reservations is what makes the
+system hold. Reservations hold a trader's capital regardless of what the exchange chooses
+to do with a signature. An earlier version of this design let withdrawals through and
+rested the guarantee on refusing at settlement; preapproval would have gone straight
+through that.
+
+**Where the enforcement actually lives — and this part is now built.** Settlement has to
+*pull* tokens from the vault, so the vault's allowance to whoever settles is a kill
+switch that needs nobody's cooperation and is checked live, by the token itself, on
+every pull. An allowance cannot be cached the way a signature answer can.
+`authoriseOrder` grants exactly the reserved amount to the venue's
+`settlementSpender()`, and cancelling or expiring an order revokes it — so a stale
+preapproved order becomes genuinely unsettleable rather than merely disowned, and the
+claim holds without EIP-1271 being consulted at all.
+
+The mirror is an upper bound rather than an exact figure, for the same reason a
+reservation holds its full worst case: a fill consumes real allowance and the vault
+cannot see it happen, so re-syncing can restore allowance a fill had already spent. It
+is bounded by orders the vault authorised and reserved against, and the exchange's own
+fill accounting stops one order settling twice. Wrong in the safe direction, and wrong
+the same way the reservation is.
+
+The ERC-1155 side is the adapter's, not the vault's: outcome tokens live in the adapter,
+and the vault's custody is of quote tokens.
+
+What is still genuinely open is per-vault attribution of an order-book settlement. When
+the exchange pulls from the pooled balance, no vault's `idle` decreases, because the
+vault is not in that transaction. The aggregate stays solvent — every live reservation
+is backed by its own vault's idle — but reconciling a settled fill back to the vault
+that caused it needs a settlement notification, and that is not designed yet.
+
+### What is not built, and why
+
+The venue-facing signature entry point. Everything above is the seam it plugs into, and
+Q1 coming back positive means it is now buildable. The allowance mirroring it needed to
+sit alongside is in place, so this is no longer blocked on anything but the work.
+
+Per-vault attribution of an order-book settlement, described above. The aggregate is
+safe; the bookkeeping is not yet.
+
+`src/adapters/` still does not exist. `IVenueAdapter.execute` remains documented as
+requiring atomicity, and an adapter that merely queues an order does not satisfy it and
+must not be whitelisted — the order-book case has its own path rather than being
+smuggled through that one.
 
 ---
 
@@ -171,11 +351,12 @@ This is the first thing to resolve with anyone from the Polymarket or Polygon si
 ```
 src/
   AgentRegistry.sol           builders, listings, bonds, tiers, AUM ceilings
-  AgentVault.sol              custody, limit enforcement, fee assessment
+  AgentVault.sol              custody, limit enforcement, order reservations, fees
   VenueWhitelist.sol          timelocked allowlist with a veto-only guardian
   interfaces/
     IAgentRegistry.sol
-    IVenueAdapter.sol         the seam described in §4
+    IVenueAdapter.sol         the seam described in §4: execute, exit,
+                              settlementSpender, positionValue
   libraries/
     HighWaterMark.sol         fee accounting
     Constants.sol             locked launch parameters and governance guardrails
@@ -185,6 +366,7 @@ test/
   HighWaterMark.t.sol         variance-farming scenarios plus fuzz invariants
   AgentRegistry.t.sol         bonding, tiers, listing lifecycle, AUM ceiling
   AgentVault.t.sol            custody, limits, isolation, fees
+  Reservations.t.sol          order authorisation and the permission-free exit
   VenueWhitelist.t.sol        the Drift lesson, encoded
 script/
   Deploy.s.sol                real deployment
@@ -216,8 +398,10 @@ To exercise it against a live node, run `make anvil` in one terminal and
   difference, so this is on the operator.
 - `GUARDIAN` must be a separate key, held by a different person, on different hardware.
   A guardian on the same laptop as governance is decoration.
-- Audit, covering `HighWaterMark` and `AgentVault.executeTrade` first.
-- §4 resolved and documented, not worked around.
+- Audit, covering `HighWaterMark`, `AgentVault.executeTrade`, and the order-reservation
+  path first.
+- §4's three questions answered, and the signature entry point built against the answers
+  rather than around them.
 
 ---
 

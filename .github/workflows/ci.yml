@@ -28,4 +28,6 @@ jobs:
         run: forge test -vvv
 
       - name: Coverage
-        run: forge coverage --no-match-coverage "(test|script)"
+        # --ir-minimum because coverage disables the optimizer, and the generated getter
+        # for the twelve-field Vault struct goes stack-too-deep without it.
+        run: forge coverage --ir-minimum --no-match-coverage "(test|script)"
