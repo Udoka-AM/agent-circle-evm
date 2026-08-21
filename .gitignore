@@ -1,0 +1,10 @@
+out/
+cache/
+broadcast/
+# lib/ is deliberately NOT ignored: dependencies are git submodules, pinned in
+# .gitmodules and foundry.lock, so a fresh clone builds reproducibly.
+docs/book/
+.env
+.env.*
+!.env.example
+.DS_Store
