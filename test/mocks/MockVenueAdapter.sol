@@ -5,34 +5,36 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { IVenueAdapter } from "../../src/interfaces/IVenueAdapter.sol";
 
 /// A venue that behaves. Pulls the requested spend and books it as a position whose
-/// mark-to-market value the test controls directly, so the drawdown and position-cap
-/// paths can be driven without a real prediction market.
+/// mark-to-market value the test controls directly, so the drawdown and position-cap paths
+/// can be driven without a real prediction market.
+///
+/// Positions key on the vault's address, which is now the whole of a vault's identity.
 contract MockVenueAdapter is IVenueAdapter {
     IERC20 public immutable token;
-    mapping(bytes32 => uint256) public positions;
+    mapping(address => uint256) public positions;
 
     constructor(address token_) {
         token = IERC20(token_);
     }
 
-    /// data = abi.encode(vaultId, spend, markToValue)
+    /// data = abi.encode(spend, markToValue)
     ///
-    /// `spend > 0` opens or adds to a position. `spend == 0` with an open position
-    /// closes it and returns the marked value to the vault, which is how a real venue
-    /// settles — the adapter must actually hold the tokens it pays out, so a test
-    /// simulating a win has to fund the counterparty side first.
+    /// `spend > 0` opens or adds to a position. `spend == 0` with an open position closes
+    /// it and returns the marked value to the vault, which is how a real venue settles —
+    /// the adapter must actually hold the tokens it pays out, so a test simulating a win
+    /// has to fund the counterparty side first.
     function execute(address vault, bytes calldata data) external returns (bytes memory) {
-        (bytes32 id, uint256 spend, uint256 markTo) = abi.decode(data, (bytes32, uint256, uint256));
+        (uint256 spend, uint256 markTo) = abi.decode(data, (uint256, uint256));
 
         if (spend > 0) {
             token.transferFrom(vault, address(this), spend);
-            positions[id] = markTo;
-        } else if (positions[id] > 0 && markTo == 0) {
-            uint256 payout = positions[id];
-            positions[id] = 0;
+            positions[vault] = markTo;
+        } else if (positions[vault] > 0 && markTo == 0) {
+            uint256 payout = positions[vault];
+            positions[vault] = 0;
             token.transfer(vault, payout);
         } else {
-            positions[id] = markTo;
+            positions[vault] = markTo;
         }
         return "";
     }
@@ -42,23 +44,12 @@ contract MockVenueAdapter is IVenueAdapter {
     ///
     /// data = abi.encode(portionBps): 10_000 closes the whole position, less closes part,
     /// which is how a partial exit and a resolved-market redemption both look from here.
-    function exit(address vault, bytes32 id, bytes calldata data) external returns (uint256) {
+    function exit(address vault, bytes calldata data) external returns (uint256) {
         uint256 portionBps = abi.decode(data, (uint256));
-        uint256 payout = (positions[id] * portionBps) / 10_000;
-        positions[id] -= payout;
+        uint256 payout = (positions[vault] * portionBps) / 10_000;
+        positions[vault] -= payout;
         if (payout > 0) token.transfer(vault, payout);
         return payout;
-    }
-
-    /// Simulate a position moving after the fact.
-    function setPositionValue(bytes32 id, uint256 value) external {
-        positions[id] = value;
-    }
-
-    /// Return capital to the vault, as closing a position would.
-    function settle(address vault, bytes32 id, uint256 amount) external {
-        positions[id] = 0;
-        token.transfer(vault, amount);
     }
 
     /// Settles atomically, so it pulls for itself.
@@ -66,8 +57,19 @@ contract MockVenueAdapter is IVenueAdapter {
         return address(this);
     }
 
-    function positionValue(address, bytes32 id) external view returns (uint256) {
-        return positions[id];
+    /// Simulate a position moving after the fact.
+    function setPositionValue(address vault, uint256 value) external {
+        positions[vault] = value;
+    }
+
+    /// Return capital to the vault, as closing a position would.
+    function settle(address vault, uint256 amount) external {
+        positions[vault] = 0;
+        token.transfer(vault, amount);
+    }
+
+    function positionValue(address vault) external view returns (uint256) {
+        return positions[vault];
     }
 
     function quoteToken() external view returns (address) {
@@ -92,7 +94,7 @@ contract GreedyVenueAdapter is IVenueAdapter {
     /// Treats an "exit" as another chance to pull from the vault. The vault grants no
     /// allowance here, so this reverts — and would be caught by the balance check even if
     /// an allowance were somehow left standing.
-    function exit(address vault, bytes32, bytes calldata data) external returns (uint256) {
+    function exit(address vault, bytes calldata data) external returns (uint256) {
         uint256 grab = abi.decode(data, (uint256));
         token.transferFrom(vault, address(this), grab);
         return 0;
@@ -102,7 +104,7 @@ contract GreedyVenueAdapter is IVenueAdapter {
         return address(this);
     }
 
-    function positionValue(address, bytes32) external pure returns (uint256) {
+    function positionValue(address) external pure returns (uint256) {
         return 0;
     }
 
@@ -127,7 +129,7 @@ contract BookVenueAdapter is IVenueAdapter {
         revert("entry is via the book, not here");
     }
 
-    function exit(address, bytes32, bytes calldata) external pure returns (uint256) {
+    function exit(address, bytes calldata) external pure returns (uint256) {
         return 0;
     }
 
@@ -135,7 +137,7 @@ contract BookVenueAdapter is IVenueAdapter {
         return exchange;
     }
 
-    function positionValue(address, bytes32) external pure returns (uint256) {
+    function positionValue(address) external pure returns (uint256) {
         return 0;
     }
 

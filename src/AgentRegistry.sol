@@ -27,7 +27,13 @@ contract AgentRegistry is IAgentRegistry, ReentrancyGuard {
 
     address public governance;
     address public guardian;
-    address public vault;
+    /// The one contract permitted to mint vaults, and through them to move AUM figures.
+    address public vaultFactory;
+
+    /// Vaults the factory has vouched for. Membership, not identity: there is no longer a
+    /// single vault address, so authority has to be a set the factory writes and nobody
+    /// else can.
+    mapping(address => bool) public isVault;
 
     /// Bond required for each tier, ascending.
     uint256[3] public tierBonds;
@@ -47,7 +53,8 @@ contract AgentRegistry is IAgentRegistry, ReentrancyGuard {
     event ListingRejected(bytes32 indexed listingId);
     event ListingSuspended(bytes32 indexed listingId, address indexed by);
     event AgentAuthorityChanged(bytes32 indexed listingId, address indexed next);
-    event VaultSet(address indexed vault);
+    event VaultFactorySet(address indexed factory);
+    event VaultRegistered(address indexed vault);
     event GuardianChanged(address indexed previous, address indexed next);
 
     modifier onlyGovernance() {
@@ -279,7 +286,7 @@ contract AgentRegistry is IAgentRegistry, ReentrancyGuard {
     // ────────────────────────────────────────────────────────── AUM
 
     function notifyAumDelta(bytes32 id, int256 delta) external {
-        if (msg.sender != vault) revert Errors.NotVault();
+        if (!isVault[msg.sender]) revert Errors.NotVault();
         Listing storage l = _listings[id];
         if (l.status == ListingStatus.None) revert Errors.ListingNotFound();
 
@@ -305,14 +312,30 @@ contract AgentRegistry is IAgentRegistry, ReentrancyGuard {
 
     // ────────────────────────────────────────────────────────── governance
 
-    /// One-shot. The vault is the only contract permitted to move AUM figures, so making
-    /// it re-settable would let a compromised governance key point the registry at a
-    /// contract that mints headroom out of nothing.
-    function setVault(address vault_) external onlyGovernance {
-        if (vault != address(0)) revert Errors.AlreadySet();
+    /// One-shot, for the same reason it always was: whatever can move AUM figures can
+    /// mint headroom out of nothing, so a compromised governance key must not be able to
+    /// re-point it. What changed is only what gets trusted. There is no longer a single
+    /// vault to name — vaults are per trader and per listing now — so governance trusts
+    /// one factory, and the factory vouches for the vaults it deploys.
+    ///
+    /// The trust is no wider than before. A factory that could be made to vouch for an
+    /// arbitrary address would be exactly as dangerous as a re-settable vault, which is
+    /// why `registerVault` is callable by nobody else and the factory only ever calls it
+    /// for a clone it has just created itself.
+    function setVaultFactory(address factory) external onlyGovernance {
+        if (vaultFactory != address(0)) revert Errors.AlreadySet();
+        if (factory == address(0)) revert Errors.ZeroAddress();
+        vaultFactory = factory;
+        emit VaultFactorySet(factory);
+    }
+
+    /// Called by the factory as it deploys a vault, and by nothing else.
+    function registerVault(address vault_) external {
+        if (msg.sender != vaultFactory) revert Errors.NotVaultFactory();
         if (vault_ == address(0)) revert Errors.ZeroAddress();
-        vault = vault_;
-        emit VaultSet(vault_);
+        if (isVault[vault_]) revert Errors.AlreadySet();
+        isVault[vault_] = true;
+        emit VaultRegistered(vault_);
     }
 
     function setGuardian(address next) external onlyGovernance {

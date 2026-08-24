@@ -45,4 +45,7 @@ interface IAgentRegistry {
     /// The AUM ceiling is enforced per-*builder* across all their listings, so it cannot
     /// be tracked inside a single vault.
     function notifyAumDelta(bytes32 listingId, int256 delta) external;
+
+    /// Called by the vault factory as it deploys a vault, to vouch for it.
+    function registerVault(address vault) external;
 }

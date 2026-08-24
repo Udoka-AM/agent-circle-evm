@@ -4,6 +4,7 @@ pragma solidity 0.8.24;
 import { Test, console2 } from "forge-std/Test.sol";
 import { AgentRegistry } from "../src/AgentRegistry.sol";
 import { AgentVault } from "../src/AgentVault.sol";
+import { AgentVaultFactory } from "../src/AgentVaultFactory.sol";
 import { VenueWhitelist } from "../src/VenueWhitelist.sol";
 import { IAgentRegistry } from "../src/interfaces/IAgentRegistry.sol";
 import { Constants } from "../src/libraries/Constants.sol";
@@ -16,6 +17,8 @@ import { MockVenueAdapter } from "./mocks/MockVenueAdapter.sol";
 /// This is the fastest way for someone new to the codebase to see what the system does.
 contract JourneyTest is Test {
     AgentRegistry registry;
+    AgentVault implementation;
+    AgentVaultFactory factory;
     AgentVault vault;
     VenueWhitelist whitelist;
     MockERC20 usdc;
@@ -48,11 +51,13 @@ contract JourneyTest is Test {
             Constants.DEFAULT_UNBOND_PERIOD
         );
         whitelist = new VenueWhitelist(governance, guardian, Constants.VENUE_TIMELOCK_DELAY);
-        vault = new AgentVault(address(usdc), address(registry), address(whitelist), treasury);
+        implementation =
+            new AgentVault(address(usdc), address(registry), address(whitelist), treasury);
+        factory = new AgentVaultFactory(address(implementation), address(registry));
         venue = new MockVenueAdapter(address(usdc));
 
         vm.prank(governance);
-        registry.setVault(address(vault));
+        registry.setVaultFactory(address(factory));
         console2.log("  registry / whitelist / vault deployed and wired");
 
         console2.log("");
@@ -93,24 +98,21 @@ contract JourneyTest is Test {
         console2.log("=== 5. Trader allocates capital ===");
         usdc.mint(trader, 10_000 * UNIT);
         vm.startPrank(trader);
+        vault = AgentVault(factory.openVault(listingId, 0, 0));
         usdc.approve(address(vault), type(uint256).max);
-        bytes32 id = vault.openVault(listingId, 0, 0);
-        vault.deposit(id, 10_000 * UNIT);
+        vault.deposit(10_000 * UNIT);
         vm.stopPrank();
-        console2.log("  deposited:", _usd(vault.totalValue(id)));
+        console2.log("  deposited:", _usd(vault.totalValue()));
         console2.log("  trader is sole withdrawal authority");
 
         console2.log("");
         console2.log("=== 6. Agent trades within its limits ===");
         vm.prank(agent);
         vault.executeTrade(
-            id,
-            address(venue),
-            1_000 * UNIT,
-            abi.encode(id, uint256(1_000 * UNIT), uint256(1_000 * UNIT))
+            address(venue), 1_000 * UNIT, abi.encode(uint256(1_000 * UNIT), uint256(1_000 * UNIT))
         );
         console2.log("  opened a $1,000 position (1000bps, inside the 1200bps cap)");
-        console2.log("  total value:", _usd(vault.totalValue(id)));
+        console2.log("  total value:", _usd(vault.totalValue()));
 
         console2.log("");
         console2.log("=== 7. Agent tries to breach the position cap ===");
@@ -120,30 +122,29 @@ contract JourneyTest is Test {
                 abi.encodeCall(
                     AgentVault.executeTrade,
                     (
-                        id,
                         address(venue),
                         2_000 * UNIT,
-                        abi.encode(id, uint256(2_000 * UNIT), uint256(2_000 * UNIT))
+                        abi.encode(uint256(2_000 * UNIT), uint256(2_000 * UNIT))
                     )
                 )
             );
         assertFalse(ok, "must revert");
         console2.log("  reverted. enforced in the same tx as the trade, not after it");
-        console2.log("  total value unchanged:", _usd(vault.totalValue(id)));
+        console2.log("  total value unchanged:", _usd(vault.totalValue()));
 
         console2.log("");
         console2.log("=== 8. Position wins; fees assessed on profit only ===");
-        venue.setPositionValue(id, 2_000 * UNIT);
-        console2.log("  position doubled, total value:", _usd(vault.totalValue(id)));
+        venue.setPositionValue(address(vault), 2_000 * UNIT);
+        console2.log("  position doubled, total value:", _usd(vault.totalValue()));
         vm.warp(block.timestamp + Constants.FEE_ASSESSMENT_INTERVAL);
-        vault.assessFees(id);
+        vault.assessFees();
         console2.log("  builder received: ", _usd(usdc.balanceOf(builder)));
         console2.log("  treasury received:", _usd(usdc.balanceOf(treasury)));
 
         console2.log("");
         console2.log("=== 9. Second assessment charges nothing ===");
         vm.warp(block.timestamp + Constants.FEE_ASSESSMENT_INTERVAL);
-        vault.assessFees(id);
+        vault.assessFees();
         console2.log("  builder still at:", _usd(usdc.balanceOf(builder)));
         console2.log("  high-water mark prevents billing the same profit twice");
 
@@ -153,10 +154,10 @@ contract JourneyTest is Test {
         // tokens it actually holds.
         usdc.mint(address(venue), 1_000 * UNIT);
         vm.prank(agent);
-        vault.executeTrade(id, address(venue), 0, abi.encode(id, uint256(0), uint256(0)));
-        (,, uint256 idle,,,,,,,,,) = vault.vaults(id);
+        vault.executeTrade(address(venue), 0, abi.encode(uint256(0), uint256(0)));
+        uint256 idle = vault.idle();
         vm.prank(trader);
-        vault.withdraw(id, idle);
+        vault.withdraw(idle);
         console2.log("  trader walked away with:", _usd(usdc.balanceOf(trader)));
 
         assertGt(usdc.balanceOf(builder), 0, "builder earned on real profit");

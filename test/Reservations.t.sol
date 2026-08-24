@@ -4,6 +4,7 @@ pragma solidity 0.8.24;
 import { Test } from "forge-std/Test.sol";
 import { AgentRegistry } from "../src/AgentRegistry.sol";
 import { AgentVault } from "../src/AgentVault.sol";
+import { AgentVaultFactory } from "../src/AgentVaultFactory.sol";
 import { VenueWhitelist } from "../src/VenueWhitelist.sol";
 import { IAgentRegistry } from "../src/interfaces/IAgentRegistry.sol";
 import { Errors } from "../src/libraries/Errors.sol";
@@ -21,6 +22,8 @@ import {
 /// Position cap here is 12% of a 10,000 vault — 1,200 per position.
 contract ReservationsTest is Test {
     AgentRegistry registry;
+    AgentVault implementation;
+    AgentVaultFactory factory;
     AgentVault vault;
     VenueWhitelist whitelist;
     MockERC20 usdc;
@@ -37,7 +40,6 @@ contract ReservationsTest is Test {
 
     uint256 constant UNIT = 1e6;
     bytes32 listingId;
-    bytes32 id;
 
     bytes32 constant ORDER_A = keccak256("order-a");
     bytes32 constant ORDER_B = keccak256("order-b");
@@ -55,11 +57,13 @@ contract ReservationsTest is Test {
             14 days
         );
         whitelist = new VenueWhitelist(governance, guardian, Constants.VENUE_TIMELOCK_DELAY);
-        vault = new AgentVault(address(usdc), address(registry), address(whitelist), treasury);
+        implementation =
+            new AgentVault(address(usdc), address(registry), address(whitelist), treasury);
+        factory = new AgentVaultFactory(address(implementation), address(registry));
         venue = new MockVenueAdapter(address(usdc));
 
         vm.prank(governance);
-        registry.setVault(address(vault));
+        registry.setVaultFactory(address(factory));
 
         agentToken.mint(builder, 25_000 * UNIT);
         vm.startPrank(builder);
@@ -78,21 +82,21 @@ contract ReservationsTest is Test {
 
         usdc.mint(trader, 100_000 * UNIT);
         vm.startPrank(trader);
+        vault = AgentVault(factory.openVault(listingId, 0, 0));
         usdc.approve(address(vault), type(uint256).max);
-        id = vault.openVault(listingId, 0, 0);
-        vault.deposit(id, 10_000 * UNIT);
+        vault.deposit(10_000 * UNIT);
         vm.stopPrank();
     }
 
     function _authorise(bytes32 orderHash, uint256 maxCost) internal {
         vm.prank(agent);
         vault.authoriseOrder(
-            id, address(venue), orderHash, maxCost, uint64(block.timestamp + 10 minutes)
+            address(venue), orderHash, maxCost, uint64(block.timestamp + 10 minutes)
         );
     }
 
-    function _reserved() internal view returns (uint256 r) {
-        (,,, r,,,,,,,,) = vault.vaults(id);
+    function _reserved() internal view returns (uint256) {
+        return vault.reserved();
     }
 
     // ─────────────────────────────────── reservation accounting
@@ -103,7 +107,7 @@ contract ReservationsTest is Test {
 
         assertEq(_reserved(), 1_000 * UNIT);
         assertEq(usdc.balanceOf(address(vault)), heldBefore, "authorisation must not move money");
-        assertEq(vault.availableIdle(id), 9_000 * UNIT);
+        assertEq(vault.availableIdle(), 9_000 * UNIT);
         assertTrue(vault.isOrderAuthorised(ORDER_A));
     }
 
@@ -115,7 +119,7 @@ contract ReservationsTest is Test {
         vm.prank(agent);
         vm.expectRevert(Errors.PositionCapExceeded.selector);
         vault.authoriseOrder(
-            id, address(venue), ORDER_B, 1_000 * UNIT, uint64(block.timestamp + 10 minutes)
+            address(venue), ORDER_B, 1_000 * UNIT, uint64(block.timestamp + 10 minutes)
         );
     }
 
@@ -127,7 +131,7 @@ contract ReservationsTest is Test {
         vm.prank(agent);
         vm.expectRevert(Errors.PositionCapExceeded.selector);
         vault.executeTrade(
-            id, address(venue), 1_000 * UNIT, abi.encode(id, uint256(1_000 * UNIT), 1_000 * UNIT)
+            address(venue), 1_000 * UNIT, abi.encode(uint256(1_000 * UNIT), 1_000 * UNIT)
         );
     }
 
@@ -193,7 +197,7 @@ contract ReservationsTest is Test {
 
         vm.prank(agent);
         vault.authoriseOrder(
-            id, address(book), ORDER_A, 1_000 * UNIT, uint64(block.timestamp + 10 minutes)
+            address(book), ORDER_A, 1_000 * UNIT, uint64(block.timestamp + 10 minutes)
         );
 
         assertEq(usdc.allowance(address(vault), exchange), 1_000 * UNIT, "exchange may pull");
@@ -207,9 +211,7 @@ contract ReservationsTest is Test {
         _authorise(ORDER_A, 1_000 * UNIT);
 
         vm.prank(agent);
-        vault.executeTrade(
-            id, address(venue), 200 * UNIT, abi.encode(id, uint256(200 * UNIT), 200 * UNIT)
-        );
+        vault.executeTrade(address(venue), 200 * UNIT, abi.encode(uint256(200 * UNIT), 200 * UNIT));
 
         assertEq(
             usdc.allowance(address(vault), address(venue)),
@@ -230,7 +232,7 @@ contract ReservationsTest is Test {
 
         vm.prank(agent);
         vm.expectRevert(Errors.TooManyOpenOrders.selector);
-        vault.authoriseOrder(id, address(venue), ORDER_B, 1, uint64(block.timestamp + 10 minutes));
+        vault.authoriseOrder(address(venue), ORDER_B, 1, uint64(block.timestamp + 10 minutes));
     }
 
     /// Cancelling frees a slot, so the bound throttles concurrency rather than capping
@@ -259,7 +261,7 @@ contract ReservationsTest is Test {
 
         vm.startPrank(trader);
         vault.cancelOrders(hashes);
-        vault.withdraw(id, 10_000 * UNIT);
+        vault.withdraw(10_000 * UNIT);
         vm.stopPrank();
 
         assertEq(_reserved(), 0);
@@ -282,24 +284,21 @@ contract ReservationsTest is Test {
 
         vm.prank(trader);
         vm.expectRevert(Errors.NotAgentAuthority.selector);
-        vault.authoriseOrder(id, address(venue), ORDER_A, 100 * UNIT, exp);
+        vault.authoriseOrder(address(venue), ORDER_A, 100 * UNIT, exp);
 
         vm.prank(attacker);
         vm.expectRevert(Errors.NotAgentAuthority.selector);
-        vault.authoriseOrder(id, address(venue), ORDER_A, 100 * UNIT, exp);
+        vault.authoriseOrder(address(venue), ORDER_A, 100 * UNIT, exp);
     }
 
     function test_orderMustNameAWhitelistedVenueAndABoundedLifetime() public {
         vm.startPrank(agent);
 
         vm.expectRevert(Errors.VenueNotWhitelisted.selector);
-        vault.authoriseOrder(
-            id, attacker, ORDER_A, 100 * UNIT, uint64(block.timestamp + 10 minutes)
-        );
+        vault.authoriseOrder(attacker, ORDER_A, 100 * UNIT, uint64(block.timestamp + 10 minutes));
 
         vm.expectRevert(Errors.OrderLifetimeTooLong.selector);
         vault.authoriseOrder(
-            id,
             address(venue),
             ORDER_A,
             100 * UNIT,
@@ -307,10 +306,10 @@ contract ReservationsTest is Test {
         );
 
         vm.expectRevert(Errors.OrderExpired.selector);
-        vault.authoriseOrder(id, address(venue), ORDER_A, 100 * UNIT, uint64(block.timestamp));
+        vault.authoriseOrder(address(venue), ORDER_A, 100 * UNIT, uint64(block.timestamp));
 
         vm.expectRevert(Errors.ZeroAmount.selector);
-        vault.authoriseOrder(id, address(venue), ORDER_A, 0, uint64(block.timestamp + 10 minutes));
+        vault.authoriseOrder(address(venue), ORDER_A, 0, uint64(block.timestamp + 10 minutes));
         vm.stopPrank();
     }
 
@@ -320,7 +319,7 @@ contract ReservationsTest is Test {
         vm.prank(agent);
         vm.expectRevert(Errors.OrderAlreadyExists.selector);
         vault.authoriseOrder(
-            id, address(venue), ORDER_A, 100 * UNIT, uint64(block.timestamp + 10 minutes)
+            address(venue), ORDER_A, 100 * UNIT, uint64(block.timestamp + 10 minutes)
         );
     }
 
@@ -389,11 +388,11 @@ contract ReservationsTest is Test {
         assertTrue(vault.isOrderAuthorised(ORDER_A));
 
         vm.prank(trader);
-        vault.pauseVault(id);
+        vault.pauseVault();
         assertFalse(vault.isOrderAuthorised(ORDER_A));
 
         vm.prank(trader);
-        vault.resumeVault(id);
+        vault.resumeVault();
         assertTrue(vault.isOrderAuthorised(ORDER_A));
     }
 
@@ -402,18 +401,18 @@ contract ReservationsTest is Test {
     /// without this. The trader is not trapped: cancelling is theirs to do alone.
     function test_reservedCapitalIsNotWithdrawable() public {
         _authorise(ORDER_A, 1_000 * UNIT);
-        assertEq(vault.availableIdle(id), 9_000 * UNIT);
+        assertEq(vault.availableIdle(), 9_000 * UNIT);
 
         vm.prank(trader);
         vm.expectRevert(Errors.InsufficientBalance.selector);
-        vault.withdraw(id, 9_500 * UNIT);
+        vault.withdraw(9_500 * UNIT);
 
         vm.prank(trader);
-        vault.withdraw(id, 9_000 * UNIT);
+        vault.withdraw(9_000 * UNIT);
 
         // What must hold is that the standing allowance is still fully backed by tokens
         // this vault actually owns — never by another vault's balance.
-        assertEq(vault.availableIdle(id), 0);
+        assertEq(vault.availableIdle(), 0);
         assertEq(usdc.allowance(address(vault), address(venue)), 1_000 * UNIT);
         assertEq(_reserved(), 1_000 * UNIT, "allowance and backing move together");
 
@@ -446,11 +445,9 @@ contract ReservationsTest is Test {
         assertTrue(vault.isOrderAuthorised(ORDER_A));
 
         vm.prank(agent);
-        vault.executeTrade(
-            id, address(venue), 600 * UNIT, abi.encode(id, uint256(600 * UNIT), 600 * UNIT)
-        );
+        vault.executeTrade(address(venue), 600 * UNIT, abi.encode(uint256(600 * UNIT), 600 * UNIT));
 
-        venue.setPositionValue(id, 1_400 * UNIT);
+        venue.setPositionValue(address(vault), 1_400 * UNIT);
         assertFalse(vault.isOrderAuthorised(ORDER_A));
     }
 
@@ -458,7 +455,7 @@ contract ReservationsTest is Test {
 
     function _openPosition(uint256 spend) internal {
         vm.prank(agent);
-        vault.executeTrade(id, address(venue), spend, abi.encode(id, spend, spend));
+        vault.executeTrade(address(venue), spend, abi.encode(spend, spend));
     }
 
     function test_traderCanExitWithoutTheAgent() public {
@@ -466,10 +463,10 @@ contract ReservationsTest is Test {
         usdc.mint(address(venue), 1_000 * UNIT); // counterparty side of the payout
 
         vm.prank(trader);
-        uint256 proceeds = vault.exitPosition(id, address(venue), abi.encode(uint256(10_000)));
+        uint256 proceeds = vault.exitPosition(address(venue), abi.encode(uint256(10_000)));
 
         assertEq(proceeds, 1_000 * UNIT);
-        assertEq(vault.totalValue(id), 10_000 * UNIT);
+        assertEq(vault.totalValue(), 10_000 * UNIT);
     }
 
     function test_exitWorksWhileTheVaultIsPaused() public {
@@ -477,11 +474,11 @@ contract ReservationsTest is Test {
         usdc.mint(address(venue), 1_000 * UNIT);
 
         vm.prank(trader);
-        vault.pauseVault(id);
+        vault.pauseVault();
 
         vm.prank(trader);
-        vault.exitPosition(id, address(venue), abi.encode(uint256(10_000)));
-        assertEq(vault.totalValue(id), 10_000 * UNIT);
+        vault.exitPosition(address(venue), abi.encode(uint256(10_000)));
+        assertEq(vault.totalValue(), 10_000 * UNIT);
     }
 
     /// Governance removing a venue must stop new money going in without stranding money
@@ -495,22 +492,22 @@ contract ReservationsTest is Test {
 
         vm.prank(agent);
         vm.expectRevert(Errors.VenueNotWhitelisted.selector);
-        vault.executeTrade(id, address(venue), 1, abi.encode(id, uint256(1), uint256(1)));
+        vault.executeTrade(address(venue), 1, abi.encode(uint256(1), uint256(1)));
 
         vm.prank(trader);
-        vault.exitPosition(id, address(venue), abi.encode(uint256(10_000)));
-        assertEq(vault.totalValue(id), 10_000 * UNIT);
+        vault.exitPosition(address(venue), abi.encode(uint256(10_000)));
+        assertEq(vault.totalValue(), 10_000 * UNIT);
     }
 
     /// A vault that auto-paused into a drawdown is the one that most needs to get out,
     /// and exiting must not be blocked by the cap it is already over.
     function test_exitIsNotBlockedByAnAlreadyBreachedCap() public {
         _openPosition(1_000 * UNIT);
-        venue.setPositionValue(id, 5_000 * UNIT); // far past the 12% cap
+        venue.setPositionValue(address(vault), 5_000 * UNIT); // far past the 12% cap
         usdc.mint(address(venue), 5_000 * UNIT);
 
         vm.prank(trader);
-        uint256 proceeds = vault.exitPosition(id, address(venue), abi.encode(uint256(10_000)));
+        uint256 proceeds = vault.exitPosition(address(venue), abi.encode(uint256(10_000)));
         assertEq(proceeds, 5_000 * UNIT);
     }
 
@@ -519,10 +516,10 @@ contract ReservationsTest is Test {
         usdc.mint(address(venue), 1_000 * UNIT);
 
         vm.prank(agent);
-        uint256 proceeds = vault.exitPosition(id, address(venue), abi.encode(uint256(4_000)));
+        uint256 proceeds = vault.exitPosition(address(venue), abi.encode(uint256(4_000)));
 
         assertEq(proceeds, 400 * UNIT);
-        assertEq(vault.availableIdle(id), 9_400 * UNIT);
+        assertEq(vault.availableIdle(), 9_400 * UNIT);
     }
 
     function test_onlyTraderOrAgentCanExit() public {
@@ -530,7 +527,7 @@ contract ReservationsTest is Test {
 
         vm.prank(attacker);
         vm.expectRevert(Errors.NotTraderOrAgent.selector);
-        vault.exitPosition(id, address(venue), abi.encode(uint256(10_000)));
+        vault.exitPosition(address(venue), abi.encode(uint256(10_000)));
     }
 
     /// An "exit" that costs the vault money is not an exit. No allowance is granted on
@@ -545,9 +542,9 @@ contract ReservationsTest is Test {
 
         vm.prank(trader);
         vm.expectRevert();
-        vault.exitPosition(id, address(greedy), abi.encode(uint256(1_000 * UNIT)));
+        vault.exitPosition(address(greedy), abi.encode(uint256(1_000 * UNIT)));
 
-        assertEq(vault.availableIdle(id), 10_000 * UNIT);
+        assertEq(vault.availableIdle(), 10_000 * UNIT);
     }
 
     /// Exiting is permissive about *which* venue, but not unboundedly so: a contract this
@@ -556,18 +553,46 @@ contract ReservationsTest is Test {
     /// what the vault appears to be worth and what a builder can bill against it.
     function test_exitCannotIntroduceAnUntouchedNonWhitelistedVenue() public {
         MockVenueAdapter liar = new MockVenueAdapter(address(usdc));
-        liar.setPositionValue(id, 1_000_000 * UNIT);
+        liar.setPositionValue(address(vault), 1_000_000 * UNIT);
 
         vm.prank(trader);
         vm.expectRevert(Errors.VenueNotWhitelisted.selector);
-        vault.exitPosition(id, address(liar), abi.encode(uint256(10_000)));
+        vault.exitPosition(address(liar), abi.encode(uint256(10_000)));
 
-        assertEq(vault.totalValue(id), 10_000 * UNIT, "vault value must be unaffected");
+        assertEq(vault.totalValue(), 10_000 * UNIT, "vault value must be unaffected");
     }
 
-    function test_exitOnUnknownVaultReverts() public {
+    /// There is no such thing as an unknown vault id any more — a vault either is a
+    /// deployed contract or it is not. What replaces that check is the implementation
+    /// contract itself, which must never be usable as a vault. It holds no funds, but one
+    /// left initialisable at a known address, with whoever called first as its trader, is
+    /// a confusing object to leave lying around.
+    function test_theImplementationIsNotAVault() public {
         vm.prank(trader);
-        vm.expectRevert(Errors.VaultNotFound.selector);
-        vault.exitPosition(keccak256("nope"), address(venue), abi.encode(uint256(10_000)));
+        vm.expectRevert(Errors.VaultAlreadyExists.selector);
+        implementation.initialize(trader, listingId, 0, 0);
+
+        assertEq(implementation.trader(), address(0));
+        assertFalse(registry.isVault(address(implementation)));
+    }
+
+    /// A vault's address is derivable from public data before it exists, which is what an
+    /// order-book venue needs in order to be told who it is settling against.
+    function test_vaultAddressIsPredictable() public {
+        address predicted = factory.predictVault(trader, listingId);
+        assertEq(predicted, address(vault));
+
+        address other = makeAddr("other");
+        assertTrue(factory.predictVault(other, listingId) != predicted);
+    }
+
+    function test_oneVaultPerTraderPerListing() public {
+        assertTrue(factory.vaultExists(trader, listingId));
+
+        vm.prank(trader);
+        vm.expectRevert(Errors.VaultAlreadyExists.selector);
+        factory.openVault(listingId, 0, 0);
+
+        assertFalse(factory.vaultExists(makeAddr("nobody"), listingId));
     }
 }

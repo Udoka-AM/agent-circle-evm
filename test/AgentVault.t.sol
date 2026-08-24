@@ -4,6 +4,7 @@ pragma solidity 0.8.24;
 import { Test } from "forge-std/Test.sol";
 import { AgentRegistry } from "../src/AgentRegistry.sol";
 import { AgentVault } from "../src/AgentVault.sol";
+import { AgentVaultFactory } from "../src/AgentVaultFactory.sol";
 import { VenueWhitelist } from "../src/VenueWhitelist.sol";
 import { IAgentRegistry } from "../src/interfaces/IAgentRegistry.sol";
 import { Errors } from "../src/libraries/Errors.sol";
@@ -13,6 +14,8 @@ import { MockVenueAdapter, GreedyVenueAdapter } from "./mocks/MockVenueAdapter.s
 
 contract AgentVaultTest is Test {
     AgentRegistry registry;
+    AgentVault implementation;
+    AgentVaultFactory factory;
     AgentVault vault;
     VenueWhitelist whitelist;
     MockERC20 usdc;
@@ -29,7 +32,6 @@ contract AgentVaultTest is Test {
 
     uint256 constant UNIT = 1e6;
     bytes32 listingId;
-    bytes32 id;
 
     function setUp() public {
         usdc = new MockERC20("USD Coin", "USDC", 6);
@@ -44,11 +46,13 @@ contract AgentVaultTest is Test {
             14 days
         );
         whitelist = new VenueWhitelist(governance, guardian, Constants.VENUE_TIMELOCK_DELAY);
-        vault = new AgentVault(address(usdc), address(registry), address(whitelist), treasury);
+        implementation =
+            new AgentVault(address(usdc), address(registry), address(whitelist), treasury);
+        factory = new AgentVaultFactory(address(implementation), address(registry));
         venue = new MockVenueAdapter(address(usdc));
 
         vm.prank(governance);
-        registry.setVault(address(vault));
+        registry.setVaultFactory(address(factory));
 
         // Builder bonds to tier 1 and gets a listing approved.
         agentToken.mint(builder, 25_000 * UNIT);
@@ -69,15 +73,15 @@ contract AgentVaultTest is Test {
         // Trader opens and funds a vault.
         usdc.mint(trader, 100_000 * UNIT);
         vm.startPrank(trader);
+        vault = AgentVault(factory.openVault(listingId, 0, 0));
         usdc.approve(address(vault), type(uint256).max);
-        id = vault.openVault(listingId, 0, 0);
-        vault.deposit(id, 10_000 * UNIT);
+        vault.deposit(10_000 * UNIT);
         vm.stopPrank();
     }
 
     function _trade(uint256 spend, uint256 markTo) internal {
         vm.prank(agent);
-        vault.executeTrade(id, address(venue), spend, abi.encode(id, spend, markTo));
+        vault.executeTrade(address(venue), spend, abi.encode(spend, markTo));
     }
 
     // ─────────────────────────────────────── custody
@@ -85,14 +89,14 @@ contract AgentVaultTest is Test {
     function test_onlyTraderCanWithdraw() public {
         vm.prank(agent);
         vm.expectRevert(Errors.NotTrader.selector);
-        vault.withdraw(id, 1 * UNIT);
+        vault.withdraw(1 * UNIT);
 
         vm.prank(attacker);
         vm.expectRevert(Errors.NotTrader.selector);
-        vault.withdraw(id, 1 * UNIT);
+        vault.withdraw(1 * UNIT);
 
         vm.prank(trader);
-        vault.withdraw(id, 1_000 * UNIT);
+        vault.withdraw(1_000 * UNIT);
         assertEq(usdc.balanceOf(trader), 91_000 * UNIT);
     }
 
@@ -101,17 +105,17 @@ contract AgentVaultTest is Test {
     function test_agentCannotReachAnArbitraryAddress() public {
         vm.prank(agent);
         vm.expectRevert(Errors.VenueNotWhitelisted.selector);
-        vault.executeTrade(id, attacker, 10_000 * UNIT, "");
+        vault.executeTrade(attacker, 10_000 * UNIT, "");
     }
 
     function test_onlyAgentAuthorityCanTrade() public {
         vm.prank(attacker);
         vm.expectRevert(Errors.NotAgentAuthority.selector);
-        vault.executeTrade(id, address(venue), 1_000 * UNIT, abi.encode(id, uint256(0), uint256(0)));
+        vault.executeTrade(address(venue), 1_000 * UNIT, abi.encode(uint256(0), uint256(0)));
 
         vm.prank(trader);
         vm.expectRevert(Errors.NotAgentAuthority.selector);
-        vault.executeTrade(id, address(venue), 1_000 * UNIT, abi.encode(id, uint256(0), uint256(0)));
+        vault.executeTrade(address(venue), 1_000 * UNIT, abi.encode(uint256(0), uint256(0)));
     }
 
     /// A rogue adapter must not be able to pull more than the agent authorised.
@@ -125,30 +129,38 @@ contract AgentVaultTest is Test {
 
         vm.prank(agent);
         vm.expectRevert(); // ERC20InsufficientAllowance
-        vault.executeTrade(id, address(greedy), 100 * UNIT, abi.encode(uint256(10_000 * UNIT)));
+        vault.executeTrade(address(greedy), 100 * UNIT, abi.encode(uint256(10_000 * UNIT)));
 
-        assertEq(vault.totalValue(id), 10_000 * UNIT, "vault untouched");
+        assertEq(vault.totalValue(), 10_000 * UNIT, "vault untouched");
     }
 
-    /// One contract holds many traders' tokens. A second trader's balance must be
-    /// unreachable from the first vault.
+    /// Isolation used to be a property of careful bookkeeping inside one contract that
+    /// held everybody's tokens. It is now structural: two vaults are two addresses, and
+    /// neither can reach the other's balance because neither holds it.
     function test_vaultsAreIsolated() public {
         address trader2 = makeAddr("trader2");
         usdc.mint(trader2, 50_000 * UNIT);
         vm.startPrank(trader2);
-        usdc.approve(address(vault), type(uint256).max);
-        bytes32 id2 = vault.openVault(listingId, 0, 0);
-        vault.deposit(id2, 5_000 * UNIT);
+        AgentVault vault2 = AgentVault(factory.openVault(listingId, 0, 0));
+        usdc.approve(address(vault2), type(uint256).max);
+        vault2.deposit(5_000 * UNIT);
         vm.stopPrank();
 
-        // Trader 1 cannot withdraw more than their own idle balance even though the
-        // contract holds 15,000 in total.
+        assertTrue(address(vault) != address(vault2), "separate deployments");
+        assertEq(usdc.balanceOf(address(vault)), 10_000 * UNIT);
+        assertEq(usdc.balanceOf(address(vault2)), 5_000 * UNIT);
+
         vm.prank(trader);
         vm.expectRevert(Errors.InsufficientBalance.selector);
-        vault.withdraw(id, 12_000 * UNIT);
+        vault.withdraw(12_000 * UNIT);
 
-        assertEq(vault.totalValue(id), 10_000 * UNIT);
-        assertEq(vault.totalValue(id2), 5_000 * UNIT);
+        // And trader 1 is simply not the trader of vault 2.
+        vm.prank(trader);
+        vm.expectRevert(Errors.NotTrader.selector);
+        vault2.withdraw(1);
+
+        assertEq(vault.totalValue(), 10_000 * UNIT);
+        assertEq(vault2.totalValue(), 5_000 * UNIT);
     }
 
     // ─────────────────────────────────────── limits
@@ -158,19 +170,16 @@ contract AgentVaultTest is Test {
         vm.prank(agent);
         vm.expectRevert(Errors.PositionCapExceeded.selector);
         vault.executeTrade(
-            id,
-            address(venue),
-            2_000 * UNIT,
-            abi.encode(id, uint256(2_000 * UNIT), uint256(2_000 * UNIT))
+            address(venue), 2_000 * UNIT, abi.encode(uint256(2_000 * UNIT), uint256(2_000 * UNIT))
         );
 
-        assertEq(vault.totalValue(id), 10_000 * UNIT, "state untouched after revert");
+        assertEq(vault.totalValue(), 10_000 * UNIT, "state untouched after revert");
         assertEq(usdc.balanceOf(address(venue)), 0, "no tokens left the vault");
     }
 
     function test_tradeWithinCapSucceeds() public {
         _trade(1_000 * UNIT, 1_000 * UNIT);
-        assertEq(vault.totalValue(id), 10_000 * UNIT, "9,000 idle + 1,000 position");
+        assertEq(vault.totalValue(), 10_000 * UNIT, "9,000 idle + 1,000 position");
     }
 
     function test_drawdownBreachAutoPauses() public {
@@ -178,33 +187,33 @@ contract AgentVaultTest is Test {
 
         // Position collapses; total value falls to 9,000 against a 10,000 mark = 1000bps.
         // Still inside the 1500bps limit.
-        venue.setPositionValue(id, 0);
+        venue.setPositionValue(address(vault), 0);
         _trade(0, 0);
-        (,,,,,,,,, AgentVault.VaultStatus status,,) = vault.vaults(id);
-        assertEq(uint256(status), uint256(AgentVault.VaultStatus.Active), "1000bps is allowed");
+        assertEq(
+            uint256(vault.status()), uint256(AgentVault.VaultStatus.Active), "1000bps is allowed"
+        );
 
         // Deeper loss: idle 9,000 with a further 500 gone takes it past 1500bps.
         _trade(900 * UNIT, 0); // spends 900 into a position worth 0 → value 8,100
-        (,,,,,,,,, status,,) = vault.vaults(id);
-        assertEq(uint256(status), uint256(AgentVault.VaultStatus.Paused), "1900bps trips");
+        assertEq(uint256(vault.status()), uint256(AgentVault.VaultStatus.Paused), "1900bps trips");
 
         // Only the trader can resume.
         vm.prank(agent);
         vm.expectRevert(Errors.NotTrader.selector);
-        vault.resumeVault(id);
+        vault.resumeVault();
 
         vm.prank(trader);
-        vault.resumeVault(id);
+        vault.resumeVault();
     }
 
     function test_pausedVaultRejectsTrades() public {
         vm.prank(trader);
-        vault.pauseVault(id);
+        vault.pauseVault();
 
         vm.prank(agent);
         vm.expectRevert(Errors.VaultNotActive.selector);
         vault.executeTrade(
-            id, address(venue), 100 * UNIT, abi.encode(id, uint256(100 * UNIT), uint256(100 * UNIT))
+            address(venue), 100 * UNIT, abi.encode(uint256(100 * UNIT), uint256(100 * UNIT))
         );
     }
 
@@ -212,26 +221,24 @@ contract AgentVaultTest is Test {
         address t2 = makeAddr("t2");
         vm.prank(t2);
         vm.expectRevert(Errors.RiskOverrideNotStricter.selector);
-        vault.openVault(listingId, 5_000, 1_500);
+        factory.openVault(listingId, 5_000, 1_500);
 
         vm.prank(t2);
-        bytes32 strict = vault.openVault(listingId, 500, 500);
-        (,,,,,, uint16 cap, uint16 dd,,,,) = vault.vaults(strict);
-        assertEq(cap, 500);
-        assertEq(dd, 500);
+        AgentVault strict = AgentVault(factory.openVault(listingId, 500, 500));
+        assertEq(strict.positionCapBps(), 500);
+        assertEq(strict.maxDrawdownBps(), 500);
     }
 
     function test_riskLimitsCanOnlyBeTightened() public {
         vm.startPrank(trader);
         vm.expectRevert(Errors.RiskOverrideNotStricter.selector);
-        vault.tightenRiskLimits(id, 2_000, 1_500);
+        vault.tightenRiskLimits(2_000, 1_500);
 
-        vault.tightenRiskLimits(id, 600, 800);
+        vault.tightenRiskLimits(600, 800);
         vm.stopPrank();
 
-        (,,,,,, uint16 cap, uint16 dd,,,,) = vault.vaults(id);
-        assertEq(cap, 600);
-        assertEq(dd, 800);
+        assertEq(vault.positionCapBps(), 600);
+        assertEq(vault.maxDrawdownBps(), 800);
     }
 
     function test_suspendedListingStopsTrading() public {
@@ -241,12 +248,12 @@ contract AgentVaultTest is Test {
         vm.prank(agent);
         vm.expectRevert(Errors.ListingNotLive.selector);
         vault.executeTrade(
-            id, address(venue), 100 * UNIT, abi.encode(id, uint256(100 * UNIT), uint256(100 * UNIT))
+            address(venue), 100 * UNIT, abi.encode(uint256(100 * UNIT), uint256(100 * UNIT))
         );
 
         // Trader funds stay withdrawable throughout. Suspension is not confiscation.
         vm.prank(trader);
-        vault.withdraw(id, 10_000 * UNIT);
+        vault.withdraw(10_000 * UNIT);
         assertEq(usdc.balanceOf(trader), 100_000 * UNIT);
     }
 
@@ -256,7 +263,7 @@ contract AgentVaultTest is Test {
         // Tier 1 ceiling is 25,000 and 10,000 is already in.
         vm.prank(trader);
         vm.expectRevert(Errors.AumCeilingExceeded.selector);
-        vault.deposit(id, 20_000 * UNIT);
+        vault.deposit(20_000 * UNIT);
     }
 
     // ─────────────────────────────────────── fees
@@ -265,11 +272,11 @@ contract AgentVaultTest is Test {
         _trade(1_000 * UNIT, 1_000 * UNIT);
 
         // Position doubles: total value 11,000 against a 10,000 mark = 1,000 profit.
-        venue.setPositionValue(id, 2_000 * UNIT);
-        assertEq(vault.totalValue(id), 11_000 * UNIT);
+        venue.setPositionValue(address(vault), 2_000 * UNIT);
+        assertEq(vault.totalValue(), 11_000 * UNIT);
 
         vm.warp(block.timestamp + Constants.FEE_ASSESSMENT_INTERVAL);
-        vault.assessFees(id);
+        vault.assessFees();
 
         assertEq(usdc.balanceOf(builder), 80 * UNIT, "80% of a 100 fee");
         assertEq(usdc.balanceOf(treasury), 20 * UNIT);
@@ -277,25 +284,25 @@ contract AgentVaultTest is Test {
 
     function test_feeCannotBeAssessedTwiceForTheSameProfit() public {
         _trade(1_000 * UNIT, 1_000 * UNIT);
-        venue.setPositionValue(id, 2_000 * UNIT);
+        venue.setPositionValue(address(vault), 2_000 * UNIT);
 
         vm.warp(block.timestamp + Constants.FEE_ASSESSMENT_INTERVAL);
-        vault.assessFees(id);
+        vault.assessFees();
         uint256 afterFirst = usdc.balanceOf(builder);
 
         vm.warp(block.timestamp + Constants.FEE_ASSESSMENT_INTERVAL);
-        vault.assessFees(id);
+        vault.assessFees();
         assertEq(usdc.balanceOf(builder), afterFirst, "same profit must not pay twice");
     }
 
     function test_crankIsRateLimited() public {
         vm.expectRevert(Errors.FeeAssessmentTooSoon.selector);
-        vault.assessFees(id);
+        vault.assessFees();
     }
 
     function test_noFeeWhenFlat() public {
         vm.warp(block.timestamp + Constants.FEE_ASSESSMENT_INTERVAL);
-        vault.assessFees(id);
+        vault.assessFees();
         assertEq(usdc.balanceOf(builder), 0);
         assertEq(usdc.balanceOf(treasury), 0);
     }

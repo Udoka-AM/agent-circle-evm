@@ -11,6 +11,7 @@ library Errors {
     error NotGovernance();
     error NotGuardian();
     error NotVault();
+    error NotVaultFactory();
     error NotTraderOrAgent();
 
     // ── lifecycle

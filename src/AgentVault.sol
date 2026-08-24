@@ -12,19 +12,31 @@ import { Errors } from "./libraries/Errors.sol";
 import { Constants } from "./libraries/Constants.sol";
 import { HighWaterMark } from "./libraries/HighWaterMark.sol";
 
-/// Non-custodial vault for agent-directed capital.
+/// Non-custodial vault for agent-directed capital. One deployment per `(trader, listing)`.
 ///
-/// The trader is the sole withdrawal authority. The agent holds scoped permission to
-/// trade and nothing else: it can never move funds out, only move them between
-/// whitelisted venues, and only within limits this contract enforces in the same
-/// transaction as the trade.
+/// The trader is the sole withdrawal authority. The agent holds scoped permission to trade
+/// and nothing else: it can never move funds out, only move them between whitelisted
+/// venues, and only within limits this contract enforces.
 ///
-/// ## One contract, many vaults
+/// ## One vault, one address
 ///
-/// A vault is a `(trader, listing)` pair keyed by hash, not a separate deployment.
-/// The security properties are per-vault; the token custody is not. This contract holds
-/// many traders' tokens at once, so per-vault `idle` bookkeeping is load-bearing and the
-/// contract's own ERC-20 balance must never be read as any single vault's balance.
+/// This was a singleton — one contract holding every trader's tokens against a mapping of
+/// `(trader, listing)` hashes. It is now an implementation contract cloned per vault by
+/// `AgentVaultFactory`, because an order book forces the question.
+///
+/// Polymarket's exchange pulls a maker's collateral from `order.maker` and delivers the
+/// outcome tokens back to `order.maker`, with no alternate recipient. Under a singleton
+/// every vault in the protocol would share one maker identity: positions would arrive
+/// commingled at one address with no on-chain way to say whose is whose, which leaves
+/// `positionValue` — and therefore the position cap and the drawdown check — unable to
+/// answer honestly. See ADR-0001.
+///
+/// Identity being an address rather than a mapping key is not a convenience here. It is
+/// the only form of identity a third party settling our trades can be told about.
+///
+/// Two things follow that used to need care and no longer do. A vault's own token balance
+/// *is* its balance. And the allowance mirror is exact rather than an upper bound
+/// aggregated across every vault sharing one contract.
 contract AgentVault is ReentrancyGuard {
     using SafeERC20 for IERC20;
     using HighWaterMark for HighWaterMark.State;
@@ -36,25 +48,9 @@ contract AgentVault is ReentrancyGuard {
         Closing
     }
 
-    struct Vault {
-        address trader;
-        bytes32 listingId;
-        uint256 idle; // quote tokens not currently deployed to a venue
-        uint256 reserved; // worst-case cost of authorised orders not yet expired
-        uint256 principal; // net deposits
-        uint256 highWaterMark;
-        uint16 positionCapBps;
-        uint16 maxDrawdownBps;
-        bool autoPause;
-        VaultStatus status;
-        uint64 lastFeeAssessment;
-        uint32 openOrders; // outstanding authorisations; packs into the tail slot
-    }
-
     /// An order the agent has authorised the vault to sign, but which the venue has not
     /// necessarily settled. Keyed by the digest the venue will ask the vault to confirm.
     struct Order {
-        bytes32 vaultId;
         address venue;
         address spender; // pinned at authorisation; who may pull for this order
         uint256 maxCost; // worst-case quote spend if this fills completely
@@ -62,35 +58,49 @@ contract AgentVault is ReentrancyGuard {
         bool released;
     }
 
+    // ── protocol-wide, and identical for every clone: immutables live in the
+    // implementation's bytecode, which every clone delegates to.
     IERC20 public immutable quoteToken;
     IAgentRegistry public immutable registry;
     VenueWhitelist public immutable whitelist;
     address public immutable platformTreasury;
 
-    mapping(bytes32 => Vault) public vaults;
+    // ── this vault
+    address public trader;
+    bytes32 public listingId;
+    uint256 public idle; // quote tokens not currently deployed to a venue
+    uint256 public reserved; // worst-case cost of authorised orders not yet expired
+    uint256 public principal; // net deposits
+    uint256 public highWaterMark;
+    uint16 public positionCapBps;
+    uint16 public maxDrawdownBps;
+    bool public autoPause;
+    VaultStatus public status;
+    uint64 public lastFeeAssessment;
+    uint32 public openOrders;
+
     mapping(bytes32 => Order) public orders;
 
-    /// Live reservations per settlement spender, across every vault. The vault's ERC-20
-    /// allowance to a spender is held equal to this, which is what makes a cancelled or
-    /// expired order actually unsettleable rather than merely disowned.
+    /// Live reservations per settlement spender. The vault's ERC-20 allowance to a spender
+    /// is held equal to this, which is what makes a cancelled or expired order actually
+    /// unsettleable rather than merely disowned.
     mapping(address => uint256) public reservedBySpender;
-    mapping(bytes32 => address[]) internal _touchedAdapters;
-    mapping(bytes32 => mapping(address => bool)) internal _hasTouched;
 
-    event VaultOpened(bytes32 indexed vaultId, address indexed trader, bytes32 indexed listingId);
-    event Deposited(bytes32 indexed vaultId, uint256 amount);
-    event Withdrawn(bytes32 indexed vaultId, uint256 amount);
-    event TradeExecuted(bytes32 indexed vaultId, address indexed venue, uint256 idleAfter);
-    event FeesAssessed(bytes32 indexed vaultId, uint256 builderCut, uint256 platformCut);
-    event StatusChanged(bytes32 indexed vaultId, VaultStatus status);
-    event AutoPaused(bytes32 indexed vaultId, uint256 drawdownBps);
-    event RiskLimitsTightened(bytes32 indexed vaultId, uint16 positionCapBps, uint16 maxDdBps);
-    event OrderAuthorised(
-        bytes32 indexed vaultId, bytes32 indexed orderHash, uint256 maxCost, uint64 expiry
-    );
-    event OrderReleased(bytes32 indexed vaultId, bytes32 indexed orderHash, uint256 maxCost);
+    address[] internal _touchedAdapters;
+    mapping(address => bool) internal _hasTouched;
+
+    event VaultOpened(address indexed trader, bytes32 indexed listingId);
+    event Deposited(uint256 amount);
+    event Withdrawn(uint256 amount);
+    event TradeExecuted(address indexed venue, uint256 idleAfter);
+    event FeesAssessed(uint256 builderCut, uint256 platformCut);
+    event StatusChanged(VaultStatus status);
+    event AutoPaused(uint256 drawdownBps);
+    event RiskLimitsTightened(uint16 positionCapBps, uint16 maxDdBps);
+    event OrderAuthorised(bytes32 indexed orderHash, uint256 maxCost, uint64 expiry);
+    event OrderReleased(bytes32 indexed orderHash, uint256 maxCost);
     event SettlementAllowanceSet(address indexed spender, uint256 amount);
-    event PositionExited(bytes32 indexed vaultId, address indexed venue, uint256 proceeds);
+    event PositionExited(address indexed venue, uint256 proceeds);
 
     constructor(
         address quoteToken_,
@@ -107,29 +117,39 @@ contract AgentVault is ReentrancyGuard {
         registry = IAgentRegistry(registry_);
         whitelist = VenueWhitelist(whitelist_);
         platformTreasury = platformTreasury_;
+
+        // The implementation itself must never be initialisable. It holds no funds, but a
+        // vault whose trader is whoever called first is a confusing thing to leave lying
+        // around at a known address.
+        status = VaultStatus.Closing;
     }
 
-    function vaultId(address trader, bytes32 listingId_) public pure returns (bytes32) {
-        return keccak256(abi.encodePacked(trader, listingId_));
+    modifier onlyTrader() {
+        if (msg.sender != trader) revert Errors.NotTrader();
+        _;
     }
 
-    modifier onlyTrader(bytes32 id) {
-        if (vaults[id].trader != msg.sender) revert Errors.NotTrader();
+    modifier onlyLive() {
+        if (status == VaultStatus.None) revert Errors.VaultNotFound();
         _;
     }
 
     // ────────────────────────────────────────────────────────── lifecycle
 
-    /// Risk overrides may only ever be *stricter* than the listing's own limits. A
-    /// trader tightening their exposure is their business; loosening it past what the
-    /// listing was vetted at would void the guarantee the leaderboard makes to everyone
-    /// else. Pass zero for either to inherit the listing's value.
-    function openVault(bytes32 listingId_, uint16 positionCapBps_, uint16 maxDrawdownBps_)
-        external
-        returns (bytes32 id)
-    {
-        id = vaultId(msg.sender, listingId_);
-        if (vaults[id].status != VaultStatus.None) revert Errors.VaultAlreadyExists();
+    /// Called once by the factory, in the transaction that deploys the clone.
+    ///
+    /// Risk overrides may only ever be *stricter* than the listing's own limits. A trader
+    /// tightening their exposure is their business; loosening it past what the listing was
+    /// vetted at would void the guarantee the leaderboard makes to everyone else. Pass zero
+    /// for either to inherit the listing's value.
+    function initialize(
+        address trader_,
+        bytes32 listingId_,
+        uint16 positionCapBps_,
+        uint16 maxDrawdownBps_
+    ) external {
+        if (status != VaultStatus.None) revert Errors.VaultAlreadyExists();
+        if (trader_ == address(0)) revert Errors.ZeroAddress();
 
         IAgentRegistry.Listing memory l = registry.getListing(listingId_);
         if (l.status != IAgentRegistry.ListingStatus.Live) revert Errors.ListingNotLive();
@@ -140,208 +160,182 @@ contract AgentVault is ReentrancyGuard {
             revert Errors.RiskOverrideNotStricter();
         }
 
-        Vault storage v = vaults[id];
-        v.trader = msg.sender;
-        v.listingId = listingId_;
-        v.positionCapBps = cap;
-        v.maxDrawdownBps = dd;
-        v.autoPause = true;
-        v.status = VaultStatus.Active;
-        v.lastFeeAssessment = uint64(block.timestamp);
+        trader = trader_;
+        listingId = listingId_;
+        positionCapBps = cap;
+        maxDrawdownBps = dd;
+        autoPause = true;
+        status = VaultStatus.Active;
+        lastFeeAssessment = uint64(block.timestamp);
 
-        emit VaultOpened(id, msg.sender, listingId_);
+        emit VaultOpened(trader_, listingId_);
     }
 
-    function deposit(bytes32 id, uint256 amount) external nonReentrant onlyTrader(id) {
+    function deposit(uint256 amount) external nonReentrant onlyTrader {
         if (amount == 0) revert Errors.ZeroAmount();
-        Vault storage v = vaults[id];
-        if (v.status != VaultStatus.Active) revert Errors.VaultNotActive();
+        if (status != VaultStatus.Active) revert Errors.VaultNotActive();
 
-        if (amount > registry.availableAumHeadroom(v.listingId)) {
+        if (amount > registry.availableAumHeadroom(listingId)) {
             revert Errors.AumCeilingExceeded();
         }
 
         quoteToken.safeTransferFrom(msg.sender, address(this), amount);
 
         HighWaterMark.State memory s =
-            HighWaterMark.State({ balance: v.idle, highWaterMark: v.highWaterMark });
+            HighWaterMark.State({ balance: idle, highWaterMark: highWaterMark });
         s = s.onDeposit(amount);
 
-        v.idle = s.balance;
-        v.highWaterMark = s.highWaterMark;
-        v.principal += amount;
+        idle = s.balance;
+        highWaterMark = s.highWaterMark;
+        principal += amount;
 
-        registry.notifyAumDelta(v.listingId, int256(amount));
-        emit Deposited(id, amount);
+        registry.notifyAumDelta(listingId, int256(amount));
+        emit Deposited(amount);
     }
 
-    /// Trader only, and fees are assessed first. Withdrawing ahead of assessment would
-    /// let a trader exit a profitable position without paying the fee that profit earned.
-    function withdraw(bytes32 id, uint256 amount) external nonReentrant onlyTrader(id) {
+    /// Trader only, and fees are assessed first. Withdrawing ahead of assessment would let
+    /// a trader exit a profitable position without paying the fee that profit earned.
+    function withdraw(uint256 amount) external nonReentrant onlyTrader {
         if (amount == 0) revert Errors.ZeroAmount();
-        _assessFees(id);
+        _assessFees();
 
-        Vault storage v = vaults[id];
-        // Against *available* idle, not raw idle. A reservation is no longer pure
-        // accounting: since the allowance mirror was added it grants a real, standing
-        // permission for the settlement spender to pull that amount. This contract pools
-        // every vault's tokens, so a trader who withdrew their own backing while leaving
-        // that permission live would let their order settle out of somebody else's
-        // balance. `isOrderAuthorised` cannot save us here — a preapproved order never
-        // asks it, and the token does not consult it either.
+        // Against *available* idle, not raw idle. A reservation is not pure accounting: it
+        // grants the settlement spender a real, standing permission to pull that amount.
+        // Withdrawing the backing while leaving that permission live would leave an
+        // allowance this vault could not honour.
         //
-        // This cannot trap anyone. Orders live at most `MAX_ORDER_LIFETIME`, and the
-        // trader can `cancelOrder` or `cancelOrders` any reservation on their own vault,
-        // so a full withdrawal is always one transaction away and never needs the agent.
-        if (amount > _availableIdle(v)) revert Errors.InsufficientBalance();
+        // This cannot trap anyone. Orders live at most `MAX_ORDER_LIFETIME`, and the trader
+        // can `cancelOrder` or `cancelOrders` any reservation on their own vault, so a full
+        // withdrawal is always one transaction away and never needs the agent.
+        if (amount > _availableIdle()) revert Errors.InsufficientBalance();
 
         HighWaterMark.State memory s =
-            HighWaterMark.State({ balance: v.idle, highWaterMark: v.highWaterMark });
+            HighWaterMark.State({ balance: idle, highWaterMark: highWaterMark });
         s = s.onWithdraw(amount);
 
-        v.idle = s.balance;
-        v.highWaterMark = s.highWaterMark;
-        v.principal = amount >= v.principal ? 0 : v.principal - amount;
+        idle = s.balance;
+        highWaterMark = s.highWaterMark;
+        principal = amount >= principal ? 0 : principal - amount;
 
-        registry.notifyAumDelta(v.listingId, -int256(amount));
-        quoteToken.safeTransfer(v.trader, amount);
-        emit Withdrawn(id, amount);
+        registry.notifyAumDelta(listingId, -int256(amount));
+        quoteToken.safeTransfer(trader, amount);
+        emit Withdrawn(amount);
     }
 
-    function pauseVault(bytes32 id) external onlyTrader(id) {
-        vaults[id].status = VaultStatus.Paused;
-        emit StatusChanged(id, VaultStatus.Paused);
+    function pauseVault() external onlyTrader {
+        status = VaultStatus.Paused;
+        emit StatusChanged(VaultStatus.Paused);
     }
 
-    function resumeVault(bytes32 id) external onlyTrader(id) {
-        Vault storage v = vaults[id];
-        if (v.status == VaultStatus.None) revert Errors.VaultNotFound();
-        v.status = VaultStatus.Active;
-        emit StatusChanged(id, VaultStatus.Active);
+    function resumeVault() external onlyTrader {
+        status = VaultStatus.Active;
+        emit StatusChanged(VaultStatus.Active);
     }
 
     /// Tighten-only, for the same reason overrides are stricter-only at open time.
-    function tightenRiskLimits(bytes32 id, uint16 positionCapBps_, uint16 maxDrawdownBps_)
-        external
-        onlyTrader(id)
-    {
-        Vault storage v = vaults[id];
-        if (positionCapBps_ > v.positionCapBps || maxDrawdownBps_ > v.maxDrawdownBps) {
+    function tightenRiskLimits(uint16 positionCapBps_, uint16 maxDrawdownBps_) external onlyTrader {
+        if (positionCapBps_ > positionCapBps || maxDrawdownBps_ > maxDrawdownBps) {
             revert Errors.RiskOverrideNotStricter();
         }
         if (positionCapBps_ == 0 || maxDrawdownBps_ == 0) revert Errors.ZeroAmount();
 
-        v.positionCapBps = positionCapBps_;
-        v.maxDrawdownBps = maxDrawdownBps_;
-        emit RiskLimitsTightened(id, positionCapBps_, maxDrawdownBps_);
+        positionCapBps = positionCapBps_;
+        maxDrawdownBps = maxDrawdownBps_;
+        emit RiskLimitsTightened(positionCapBps_, maxDrawdownBps_);
     }
 
     // ────────────────────────────────────────────────────────── trading
 
-    /// The whole design rests on this function. All six checks hold in the same
-    /// transaction as the trade, so a limit cannot be exceeded even briefly.
+    /// The whole design rests on this function. All six checks hold in the same transaction
+    /// as the trade, so a limit cannot be exceeded even briefly.
     ///
-    /// The position cap and drawdown checks are enforced as *post-conditions*: rather
-    /// than predicting what a venue call will do, the vault performs it and asserts the
-    /// resulting state is legal, reverting everything if not. Prediction is fragile
-    /// against venues we do not control; assertion is not.
+    /// The position cap and drawdown checks are enforced as *post-conditions*: rather than
+    /// predicting what a venue call will do, the vault performs it and asserts the resulting
+    /// state is legal, reverting everything if not. Prediction is fragile against venues we
+    /// do not control; assertion is not.
     ///
-    /// `maxSpend` bounds the allowance granted, so a compromised adapter cannot pull
-    /// more than the agent authorised for this one call.
-    function executeTrade(bytes32 id, address venue, uint256 maxSpend, bytes calldata data)
+    /// `maxSpend` bounds the allowance granted, so a compromised adapter cannot pull more
+    /// than the agent authorised for this one call.
+    function executeTrade(address venue, uint256 maxSpend, bytes calldata data)
         external
         nonReentrant
+        onlyLive
         returns (bytes memory result)
     {
-        Vault storage v = vaults[id];
-        if (v.status == VaultStatus.None) revert Errors.VaultNotFound();
-        if (v.status != VaultStatus.Active) revert Errors.VaultNotActive();
+        if (status != VaultStatus.Active) revert Errors.VaultNotActive();
 
-        IAgentRegistry.Listing memory l = registry.getListing(v.listingId);
+        IAgentRegistry.Listing memory l = registry.getListing(listingId);
         if (l.status != IAgentRegistry.ListingStatus.Live) revert Errors.ListingNotLive();
         if (msg.sender != l.agentAuthority) revert Errors.NotAgentAuthority();
         if (!whitelist.isWhitelisted(venue)) revert Errors.VenueNotWhitelisted();
-        if (maxSpend > v.idle) revert Errors.InsufficientBalance();
+        if (maxSpend > _availableIdle()) revert Errors.InsufficientBalance();
 
         uint256 heldBefore = quoteToken.balanceOf(address(this));
 
-        // Raised for the duration of the call and put back afterwards — back to the
-        // venue's standing settlement allowance, not to zero. An adapter that settles
-        // atomically is its own settlement spender, so zeroing here would silently revoke
-        // the mirror behind every order already authorised against it.
+        // Raised for the duration of the call and put back afterwards — back to the venue's
+        // standing settlement allowance, not to zero. An adapter that settles atomically is
+        // its own settlement spender, so zeroing here would silently revoke the mirror
+        // behind every order already authorised against it.
         quoteToken.forceApprove(venue, maxSpend);
         result = IVenueAdapter(venue).execute(address(this), data);
         quoteToken.forceApprove(venue, reservedBySpender[venue]);
 
         uint256 heldAfter = quoteToken.balanceOf(address(this));
-        _touch(id, venue);
+        _touch(venue);
 
-        // Attribute the actual token movement to this vault. A venue returning tokens
-        // (closing a position) increases idle rather than decreasing it.
         if (heldBefore >= heldAfter) {
             uint256 spent = heldBefore - heldAfter;
-            if (spent > v.idle) revert Errors.InsufficientBalance();
-            v.idle -= spent;
+            if (spent > idle) revert Errors.InsufficientBalance();
+            idle -= spent;
         } else {
-            v.idle += (heldAfter - heldBefore);
+            idle += (heldAfter - heldBefore);
         }
 
         // ── post-conditions
-        uint256 valueAfter = _totalValue(id);
-        uint256 positionValue = valueAfter - v.idle;
-
-        _requireWithinPositionCap(positionValue, v.reserved, valueAfter, v.positionCapBps);
+        uint256 valueAfter = _totalValue();
+        _requireWithinPositionCap(valueAfter - idle, reserved, valueAfter, positionCapBps);
 
         uint256 dd = HighWaterMark.drawdownBps(
-            HighWaterMark.State({ balance: valueAfter, highWaterMark: v.highWaterMark })
+            HighWaterMark.State({ balance: valueAfter, highWaterMark: highWaterMark })
         );
-        if (dd >= v.maxDrawdownBps) {
-            if (v.autoPause) {
-                v.status = VaultStatus.Paused;
-                emit AutoPaused(id, dd);
+        if (dd >= maxDrawdownBps) {
+            if (autoPause) {
+                status = VaultStatus.Paused;
+                emit AutoPaused(dd);
             } else {
                 revert Errors.DrawdownLimitBreached();
             }
         }
 
-        emit TradeExecuted(id, venue, v.idle);
+        emit TradeExecuted(venue, idle);
     }
 
     // ────────────────────────────────────────── order authorisation
 
     /// Authorise the vault to sign one venue order, reserving its worst case up front.
     ///
-    /// This is the path for venues that cannot settle atomically — where the agent signs
-    /// an order, an order book matches it, and the money moves later in a transaction
-    /// this contract is not part of. `executeTrade` is unavailable there, so the limits
-    /// have to be enforced somewhere else, and there are only two places left: before the
-    /// order is ever signed, and inside the venue's own settlement transaction when it
-    /// asks the vault to confirm the signature. This function is the first. It is not
-    /// a trade, and nothing moves here.
+    /// This is the path for venues that cannot settle atomically — where the agent signs an
+    /// order, an order book matches it, and the money moves later in a transaction this
+    /// contract is not part of. `executeTrade` is unavailable there, so the limits have to
+    /// be enforced somewhere else. This is that place, and nothing moves here.
     ///
-    /// The reservation is what makes the first place work. An order is authorised only if
-    /// the vault would still be inside its position cap on the assumption that this order
-    /// and every other outstanding one fills completely at the worst price the agent
-    /// named. Assuming the worst wastes some capital efficiency, and that is the correct
-    /// direction to be wrong in: the alternative is an agent authorising three orders
-    /// that each pass the cap alone and breach it together.
+    /// An order is authorised only if the vault would still be inside its position cap on
+    /// the assumption that this order and every other outstanding one fills completely at
+    /// the worst price the agent named. Assuming the worst wastes some capital efficiency,
+    /// and that is the correct direction to be wrong in: the alternative is an agent
+    /// authorising three orders that each pass the cap alone and breach it together.
     ///
     /// `orderHash` is the digest the venue will present back to the vault at settlement,
     /// which is how the two halves find each other.
-    function authoriseOrder(
-        bytes32 id,
-        address venue,
-        bytes32 orderHash,
-        uint256 maxCost,
-        uint64 expiry
-    ) external {
-        Vault storage v = vaults[id];
-        if (v.status == VaultStatus.None) revert Errors.VaultNotFound();
-        if (v.status != VaultStatus.Active) revert Errors.VaultNotActive();
+    function authoriseOrder(address venue, bytes32 orderHash, uint256 maxCost, uint64 expiry)
+        external
+        onlyLive
+    {
+        if (status != VaultStatus.Active) revert Errors.VaultNotActive();
         if (maxCost == 0) revert Errors.ZeroAmount();
-        if (orders[orderHash].vaultId != bytes32(0)) revert Errors.OrderAlreadyExists();
+        if (orders[orderHash].venue != address(0)) revert Errors.OrderAlreadyExists();
 
-        IAgentRegistry.Listing memory l = registry.getListing(v.listingId);
+        IAgentRegistry.Listing memory l = registry.getListing(listingId);
         if (l.status != IAgentRegistry.ListingStatus.Live) revert Errors.ListingNotLive();
         if (msg.sender != l.agentAuthority) revert Errors.NotAgentAuthority();
         if (!whitelist.isWhitelisted(venue)) revert Errors.VenueNotWhitelisted();
@@ -351,54 +345,37 @@ contract AgentVault is ReentrancyGuard {
             revert Errors.OrderLifetimeTooLong();
         }
 
-        if (v.openOrders >= Constants.MAX_OPEN_ORDERS) revert Errors.TooManyOpenOrders();
+        if (openOrders >= Constants.MAX_OPEN_ORDERS) revert Errors.TooManyOpenOrders();
 
-        uint256 reservedAfter = v.reserved + maxCost;
-        uint256 value = _totalValue(id);
+        uint256 reservedAfter = reserved + maxCost;
+        uint256 value = _totalValue();
 
-        // Reservations are backed by idle tokens, not by tokens already in a position.
-        // An order the vault could not pay for if it filled is not an order it may sign.
-        //
-        // At current cap bounds this only bites after a trader's withdrawal has already
-        // left the vault short of what is outstanding — a cap of 25% or less cannot on
-        // its own authorise more than the idle balance. It is kept as a direct statement
-        // of the invariant rather than something inferred from the cap arithmetic.
-        if (reservedAfter > v.idle) revert Errors.InsufficientBalance();
+        // Reservations are backed by idle tokens, not by tokens already in a position. An
+        // order the vault could not pay for if it filled is not an order it may sign.
+        if (reservedAfter > idle) revert Errors.InsufficientBalance();
 
-        _requireWithinPositionCap(value - v.idle, reservedAfter, value, v.positionCapBps);
+        _requireWithinPositionCap(value - idle, reservedAfter, value, positionCapBps);
 
         address spender = IVenueAdapter(venue).settlementSpender();
         if (spender == address(0)) revert Errors.ZeroAddress();
 
-        v.reserved = reservedAfter;
-        ++v.openOrders;
+        reserved = reservedAfter;
+        ++openOrders;
         orders[orderHash] = Order({
-            vaultId: id,
-            venue: venue,
-            spender: spender,
-            maxCost: maxCost,
-            expiry: expiry,
-            released: false
+            venue: venue, spender: spender, maxCost: maxCost, expiry: expiry, released: false
         });
 
         _syncSettlementAllowance(spender, reservedBySpender[spender] + maxCost);
 
-        emit OrderAuthorised(id, orderHash, maxCost, expiry);
+        emit OrderAuthorised(orderHash, maxCost, expiry);
     }
 
-    /// Withdraw an authorisation before it expires. Either party may: the agent because
-    /// it changed its mind, the trader because it is their money and waiting out the
-    /// expiry to free a reservation should not be the only option available to them.
-    function cancelOrder(bytes32 orderHash) external {
-        Order storage o = orders[orderHash];
-        if (o.vaultId == bytes32(0)) revert Errors.OrderNotFound();
-
-        Vault storage v = vaults[o.vaultId];
-        if (msg.sender != v.trader) {
-            if (msg.sender != registry.getListing(v.listingId).agentAuthority) {
-                revert Errors.NotTraderOrAgent();
-            }
-        }
+    /// Withdraw an authorisation before it expires. Either party may: the agent because it
+    /// changed its mind, the trader because it is their money and waiting out the expiry to
+    /// free a reservation should not be the only option available to them.
+    function cancelOrder(bytes32 orderHash) external onlyLive {
+        _requireTraderOrAgent();
+        if (orders[orderHash].venue == address(0)) revert Errors.OrderNotFound();
         _release(orderHash);
     }
 
@@ -407,67 +384,53 @@ contract AgentVault is ReentrancyGuard {
     /// The reason this exists rather than being left to the caller: a reservation gates a
     /// withdrawal, so the trader's route back to their own money must not get longer the
     /// more orders the agent happens to have open. With `MAX_OPEN_ORDERS` bounding the
-    /// count, clearing every reservation on a vault is always one transaction, whatever
-    /// the agent has been doing.
-    function cancelOrders(bytes32[] calldata orderHashes) external {
+    /// count, clearing every reservation on a vault is always one transaction, whatever the
+    /// agent has been doing.
+    function cancelOrders(bytes32[] calldata orderHashes) external onlyLive {
+        _requireTraderOrAgent();
         for (uint256 i; i < orderHashes.length; ++i) {
-            bytes32 orderHash = orderHashes[i];
-            Order storage o = orders[orderHash];
-            if (o.vaultId == bytes32(0)) revert Errors.OrderNotFound();
-
-            Vault storage v = vaults[o.vaultId];
-            if (msg.sender != v.trader) {
-                if (msg.sender != registry.getListing(v.listingId).agentAuthority) {
-                    revert Errors.NotTraderOrAgent();
-                }
-            }
-            _release(orderHash);
+            if (orders[orderHashes[i]].venue == address(0)) revert Errors.OrderNotFound();
+            _release(orderHashes[i]);
         }
     }
 
-    /// Permissionless once expired. A reservation that outlives the order holding it is
-    /// only ever dead weight on a trader's capital, so anyone may clear it.
-    function releaseExpiredOrder(bytes32 orderHash) external {
+    /// Permissionless once expired. A reservation that outlives the order holding it is only
+    /// ever dead weight on a trader's capital, so anyone may clear it.
+    function releaseExpiredOrder(bytes32 orderHash) external onlyLive {
         Order storage o = orders[orderHash];
-        if (o.vaultId == bytes32(0)) revert Errors.OrderNotFound();
+        if (o.venue == address(0)) revert Errors.OrderNotFound();
         if (block.timestamp <= o.expiry) revert Errors.OrderNotExpired();
         _release(orderHash);
     }
 
     /// Whether this order may still settle, evaluated against live state.
     ///
-    /// This is the settlement-time half of the design and the seam the venue-facing
-    /// signature check will be built on: when a venue asks the vault to confirm a
-    /// signature is genuine, it asks inside its own settlement transaction, and a vault
-    /// that answers no makes that settlement fail. So an order sitting on a book for an
-    /// hour cannot settle if the trader has since paused the vault, withdrawn the money
-    /// behind it, the listing has been suspended, or governance has removed the venue.
-    /// Refusing at the door is not the same as checking afterwards, but for safety
-    /// purposes it is close.
+    /// This is the seam the venue-facing signature check will be built on: when a venue asks
+    /// the vault to confirm a signature is genuine, it asks inside its own settlement
+    /// transaction, and a vault that answers no makes that settlement fail.
     ///
-    /// Deliberately a view. It cannot decrement the reservation as fills arrive, because
-    /// the venue's call is a `staticcall` and may not write — which is exactly why an
-    /// order is reserved at its full worst case and released only by expiry or by cancel.
+    /// Deliberately a view — the venue's call is a `staticcall` and may not write, which is
+    /// why an order is reserved at its full worst case and released only by expiry or by
+    /// cancel.
     ///
-    /// Nothing calls this yet. Whether a vault may sign venue orders at all is the open
-    /// question in README §4, and the signature entry point stays unwritten until it is
-    /// answered rather than being guessed at.
+    /// It is not, on its own, sufficient. Polymarket's V2 exchange lets an operator
+    /// preapprove an order, after which later matches skip the confirmation entirely and
+    /// never ask again. That is what the allowance mirror is for, and why the mirror rather
+    /// than this function carries the guarantee.
     function isOrderAuthorised(bytes32 orderHash) public view returns (bool) {
         Order storage o = orders[orderHash];
-        if (o.vaultId == bytes32(0) || o.released) return false;
+        if (o.venue == address(0) || o.released) return false;
         if (block.timestamp > o.expiry) return false;
         if (!whitelist.isWhitelisted(o.venue)) return false;
+        if (status != VaultStatus.Active) return false;
+        if (reserved > idle) return false;
 
-        Vault storage v = vaults[o.vaultId];
-        if (v.status != VaultStatus.Active) return false;
-        if (v.reserved > v.idle) return false;
-
-        if (registry.getListing(v.listingId).status != IAgentRegistry.ListingStatus.Live) {
+        if (registry.getListing(listingId).status != IAgentRegistry.ListingStatus.Live) {
             return false;
         }
 
-        uint256 value = _totalValue(o.vaultId);
-        return (value - v.idle + v.reserved) * Constants.BPS <= value * v.positionCapBps;
+        uint256 value = _totalValue();
+        return (value - idle + reserved) * Constants.BPS <= value * positionCapBps;
     }
 
     function _release(bytes32 orderHash) internal {
@@ -475,38 +438,32 @@ contract AgentVault is ReentrancyGuard {
         if (o.released) revert Errors.OrderNotFound();
 
         o.released = true;
-        Vault storage v = vaults[o.vaultId];
-        v.reserved = o.maxCost >= v.reserved ? 0 : v.reserved - o.maxCost;
-        --v.openOrders;
+        reserved = o.maxCost >= reserved ? 0 : reserved - o.maxCost;
+        --openOrders;
 
         uint256 outstanding = reservedBySpender[o.spender];
         _syncSettlementAllowance(o.spender, o.maxCost >= outstanding ? 0 : outstanding - o.maxCost);
 
-        emit OrderReleased(o.vaultId, orderHash, o.maxCost);
+        emit OrderReleased(orderHash, o.maxCost);
     }
 
     /// Hold the vault's allowance to `spender` equal to what is reserved against it.
     ///
-    /// This is where the guarantee actually lives, and it is worth being precise about
-    /// why. The settlement-time signature check was supposed to carry it — the venue asks
-    /// the vault to confirm an order, and a vault that says no makes the settlement fail.
-    /// Polymarket's V2 exchange lets an operator *preapprove* an order, after which later
-    /// matches skip the confirmation entirely and never ask again. The answer is cached,
-    /// only the operator can revoke it, and the vault is not consulted a second time.
+    /// This is where the guarantee actually lives. The settlement-time signature check was
+    /// supposed to carry it — the venue asks the vault to confirm an order, and a vault that
+    /// says no makes the settlement fail. Polymarket's V2 exchange lets an operator
+    /// *preapprove* an order, after which later matches skip the confirmation entirely. The
+    /// answer is cached, only the operator can revoke it, and the vault is never asked a
+    /// second time.
     ///
     /// An allowance cannot be cached. Settlement has to pull the tokens, and pulling is
-    /// checked against live allowance every time by the token itself. So cancelling an
-    /// order or letting it expire drops the allowance with it, and a stale order becomes
-    /// genuinely unsettleable rather than merely disowned. This needs no cooperation from
-    /// the venue, the operator, or anyone else.
+    /// checked against live allowance every time by the token itself. So cancelling an order
+    /// or letting it expire drops the allowance with it, and a stale order becomes genuinely
+    /// unsettleable rather than merely disowned. This needs no cooperation from the venue,
+    /// the operator, or anyone else.
     ///
-    /// The mirror is an upper bound, not an exact figure. A fill consumes real allowance
-    /// as it happens, and the vault cannot see that — the same blind spot that makes a
-    /// reservation hold its full worst case until expiry — so re-syncing can restore
-    /// allowance a fill had already spent. It is bounded by orders the vault genuinely
-    /// authorised and reserved against, and the exchange's own fill accounting stops the
-    /// same order settling twice. Wrong in the safe direction, and wrong the same way the
-    /// reservation is.
+    /// Now that a vault is its own address, this is exact rather than an upper bound
+    /// aggregated across every vault sharing one contract.
     function _syncSettlementAllowance(address spender, uint256 amount) internal {
         reservedBySpender[spender] = amount;
         quoteToken.forceApprove(spender, amount);
@@ -521,86 +478,77 @@ contract AgentVault is ReentrancyGuard {
     /// escape route is built to have none. Three restrictions are lifted here on purpose,
     /// and each one is a way capital could otherwise be trapped:
     ///
-    /// - The **trader may call it**, not only the agent. An agent that has gone silent,
-    ///   or hostile, must not be able to hold a position open.
-    /// - It works while the vault is **paused or closing**. A vault that auto-paused into
-    ///   a drawdown is precisely the vault that most needs to get out.
+    /// - The **trader may call it**, not only the agent. An agent that has gone silent, or
+    ///   hostile, must not be able to hold a position open.
+    /// - It works while the vault is **paused or closing**. A vault that auto-paused into a
+    ///   drawdown is precisely the vault that most needs to get out.
     /// - The venue **need not still be whitelisted**, provided this vault already traded
-    ///   through it. Governance removing a venue must stop new money going in, never
-    ///   strand money already there.
+    ///   through it. Governance removing a venue must stop new money going in, never strand
+    ///   money already there.
     ///
     /// No allowance is granted, and the vault checks its own balance rather than trusting
     /// what the adapter reports: an exit that costs money is not an exit.
-    function exitPosition(bytes32 id, address venue, bytes calldata data)
+    function exitPosition(address venue, bytes calldata data)
         external
         nonReentrant
+        onlyLive
         returns (uint256 proceeds)
     {
-        Vault storage v = vaults[id];
-        if (v.status == VaultStatus.None) revert Errors.VaultNotFound();
+        _requireTraderOrAgent();
 
-        if (msg.sender != v.trader) {
-            if (msg.sender != registry.getListing(v.listingId).agentAuthority) {
-                revert Errors.NotTraderOrAgent();
-            }
-        }
-
-        // The venue must be one this vault has actually been through, or one still
-        // approved. Without this the exit path would be a way to splice an arbitrary
-        // contract into `_touchedAdapters`, and every later `_totalValue` would sum
-        // whatever position value that contract cared to invent — inflating the vault's
-        // worth, suppressing the drawdown check, and letting a builder bill a performance
-        // fee on profit that does not exist.
-        if (!_hasTouched[id][venue] && !whitelist.isWhitelisted(venue)) {
+        // The venue must be one this vault has actually been through, or one still approved.
+        // Without this the exit path would be a way to splice an arbitrary contract into
+        // `_touchedAdapters`, and every later `_totalValue` would sum whatever position
+        // value that contract cared to invent — inflating the vault's worth, suppressing the
+        // drawdown check, and letting a builder bill a performance fee on profit that does
+        // not exist.
+        if (!_hasTouched[venue] && !whitelist.isWhitelisted(venue)) {
             revert Errors.VenueNotWhitelisted();
         }
 
         uint256 heldBefore = quoteToken.balanceOf(address(this));
-        IVenueAdapter(venue).exit(address(this), id, data);
+        IVenueAdapter(venue).exit(address(this), data);
         uint256 heldAfter = quoteToken.balanceOf(address(this));
 
         if (heldAfter < heldBefore) revert Errors.VaultValueDecreasedUnexpectedly();
         proceeds = heldAfter - heldBefore;
 
-        _touch(id, venue);
-        v.idle += proceeds;
+        _touch(venue);
+        idle += proceeds;
 
-        // No position-cap or drawdown post-condition. Both measure risk taken on, and
-        // this path only ever gives risk back; a vault already over its cap must not be
-        // blocked from reducing the position that put it there.
-        emit PositionExited(id, venue, proceeds);
+        // No position-cap or drawdown post-condition. Both measure risk taken on, and this
+        // path only ever gives risk back; a vault already over its cap must not be blocked
+        // from reducing the position that put it there.
+        emit PositionExited(venue, proceeds);
     }
 
     // ────────────────────────────────────────────────────────── fees
 
-    /// Permissionless crank, rate-limited so nobody can grind a vault down through
-    /// repeated rounding.
-    function assessFees(bytes32 id) external nonReentrant {
-        Vault storage v = vaults[id];
-        if (v.status == VaultStatus.None) revert Errors.VaultNotFound();
-        if (block.timestamp < v.lastFeeAssessment + Constants.FEE_ASSESSMENT_INTERVAL) {
+    /// Permissionless crank, rate-limited so nobody can grind a vault down through repeated
+    /// rounding.
+    function assessFees() external nonReentrant onlyLive {
+        if (block.timestamp < lastFeeAssessment + Constants.FEE_ASSESSMENT_INTERVAL) {
             revert Errors.FeeAssessmentTooSoon();
         }
-        _assessFees(id);
+        _assessFees();
     }
 
-    function _assessFees(bytes32 id) internal {
-        Vault storage v = vaults[id];
-        if (v.status == VaultStatus.None) revert Errors.VaultNotFound();
+    function _assessFees() internal {
+        if (status == VaultStatus.None) revert Errors.VaultNotFound();
 
-        IAgentRegistry.Listing memory l = registry.getListing(v.listingId);
+        IAgentRegistry.Listing memory l = registry.getListing(listingId);
 
         // Fees are charged against total value but can only be *paid* from idle tokens.
         // Capital sitting in an open position is not ours to move.
         HighWaterMark.State memory s =
-            HighWaterMark.State({ balance: _totalValue(id), highWaterMark: v.highWaterMark });
+            HighWaterMark.State({ balance: _totalValue(), highWaterMark: highWaterMark });
 
         HighWaterMark.FeeSplit memory split;
         (s, split) = s.assess(l.performanceFeeBps, l.builderSplitBps);
 
-        v.lastFeeAssessment = uint64(block.timestamp);
+        lastFeeAssessment = uint64(block.timestamp);
         if (split.total == 0) {
-            v.highWaterMark = s.highWaterMark;
+            highWaterMark = s.highWaterMark;
             return;
         }
 
@@ -609,69 +557,77 @@ contract AgentVault is ReentrancyGuard {
         // reverting matters because `withdraw` assesses fees first, and a revert here would
         // let an unpayable fee block a trader from reaching their own money — the one
         // outcome this contract must never produce.
+        //
         // Payable from *available* idle only, for the same reason a withdrawal is: a fee
-        // taken out of capital backing a live order would settle that order from another
-        // vault's balance.
-        if (split.total > _availableIdle(v)) return;
+        // taken out of capital backing a live order would leave an allowance this vault
+        // could not honour.
+        if (split.total > _availableIdle()) return;
 
-        v.highWaterMark = s.highWaterMark;
-        v.idle -= split.total;
+        highWaterMark = s.highWaterMark;
+        idle -= split.total;
 
-        // TODO(streaming): the Solana design streams the builder's cut via Streamflow
-        // rather than paying lump-sum. Sablier is the Polygon analogue. Direct until
-        // that is decided.
+        // TODO(streaming): the Solana design streams the builder's cut via Streamflow rather
+        // than paying lump-sum. Sablier is the Polygon analogue. Direct until that is
+        // decided.
         quoteToken.safeTransfer(l.builder, split.builderCut);
         quoteToken.safeTransfer(platformTreasury, split.platformCut);
 
-        emit FeesAssessed(id, split.builderCut, split.platformCut);
+        emit FeesAssessed(split.builderCut, split.platformCut);
     }
 
     // ────────────────────────────────────────────────────────── views
 
-    function totalValue(bytes32 id) external view returns (uint256) {
-        return _totalValue(id);
+    function totalValue() external view returns (uint256) {
+        return _totalValue();
     }
 
-    /// Idle tokens not already spoken for by an outstanding order. This, not `idle`, is
-    /// what a withdrawal, a fee, or a new reservation may draw on.
-    function availableIdle(bytes32 id) external view returns (uint256) {
-        return _availableIdle(vaults[id]);
+    /// Idle tokens not already spoken for by an outstanding order. This, not `idle`, is what
+    /// a withdrawal, a fee, or a new reservation may draw on.
+    function availableIdle() external view returns (uint256) {
+        return _availableIdle();
     }
 
-    function _availableIdle(Vault storage v) internal view returns (uint256) {
-        return v.reserved >= v.idle ? 0 : v.idle - v.reserved;
+    function touchedAdapters() external view returns (address[] memory) {
+        return _touchedAdapters;
     }
 
-    function touchedAdapters(bytes32 id) external view returns (address[] memory) {
-        return _touchedAdapters[id];
+    function _availableIdle() internal view returns (uint256) {
+        return reserved >= idle ? 0 : idle - reserved;
     }
 
     /// Idle tokens plus mark-to-market value of every position the vault holds.
-    function _totalValue(bytes32 id) internal view returns (uint256 total) {
-        total = vaults[id].idle;
-        address[] storage adapters = _touchedAdapters[id];
-        for (uint256 i; i < adapters.length; ++i) {
-            total += IVenueAdapter(adapters[i]).positionValue(address(this), id);
+    function _totalValue() internal view returns (uint256 total) {
+        total = idle;
+        uint256 n = _touchedAdapters.length;
+        for (uint256 i; i < n; ++i) {
+            total += IVenueAdapter(_touchedAdapters[i]).positionValue(address(this));
         }
     }
 
     /// Positions the vault holds plus the positions its outstanding orders would open if
-    /// they all filled, measured against total value. Reservations count as though they
-    /// had already happened, which is the whole point of taking them.
+    /// they all filled, measured against total value. Reservations count as though they had
+    /// already happened, which is the whole point of taking them.
     function _requireWithinPositionCap(
         uint256 positionValue,
-        uint256 reserved,
+        uint256 reserved_,
         uint256 value,
         uint16 capBps
     ) internal pure {
-        if ((positionValue + reserved) * Constants.BPS > value * capBps) {
+        if ((positionValue + reserved_) * Constants.BPS > value * capBps) {
             revert Errors.PositionCapExceeded();
         }
     }
 
-    function _touch(bytes32 id, address adapter) internal {
-        if (_hasTouched[id][adapter]) return;
-        _hasTouched[id][adapter] = true;
-        _touchedAdapters[id].push(adapter);
+    function _requireTraderOrAgent() internal view {
+        if (msg.sender == trader) return;
+        if (msg.sender != registry.getListing(listingId).agentAuthority) {
+            revert Errors.NotTraderOrAgent();
+        }
+    }
+
+    function _touch(address adapter) internal {
+        if (_hasTouched[adapter]) return;
+        _hasTouched[adapter] = true;
+        _touchedAdapters.push(adapter);
     }
 }

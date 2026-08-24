@@ -4,6 +4,7 @@ pragma solidity 0.8.24;
 import { Script, console2 } from "forge-std/Script.sol";
 import { AgentRegistry } from "../src/AgentRegistry.sol";
 import { AgentVault } from "../src/AgentVault.sol";
+import { AgentVaultFactory } from "../src/AgentVaultFactory.sol";
 import { VenueWhitelist } from "../src/VenueWhitelist.sol";
 import { Constants } from "../src/libraries/Constants.sol";
 import { MockERC20 } from "../test/mocks/MockERC20.sol";
@@ -40,11 +41,13 @@ contract DeployLocal is Script {
         );
         VenueWhitelist whitelist =
             new VenueWhitelist(deployer, deployer, Constants.VENUE_TIMELOCK_DELAY);
-        AgentVault vault =
+        AgentVault implementation =
             new AgentVault(address(usdc), address(registry), address(whitelist), deployer);
+        AgentVaultFactory factory =
+            new AgentVaultFactory(address(implementation), address(registry));
         MockVenueAdapter venue = new MockVenueAdapter(address(usdc));
 
-        registry.setVault(address(vault));
+        registry.setVaultFactory(address(factory));
 
         // Builder journey, all as the deployer for simplicity on a throwaway chain.
         agentToken.mint(deployer, 25_000 * UNIT);
@@ -56,9 +59,9 @@ contract DeployLocal is Script {
 
         // Trader journey.
         usdc.mint(deployer, 10_000 * UNIT);
+        AgentVault vault = AgentVault(factory.openVault(listingId, 0, 0));
         usdc.approve(address(vault), type(uint256).max);
-        bytes32 id = vault.openVault(listingId, 0, 0);
-        vault.deposit(id, 10_000 * UNIT);
+        vault.deposit(10_000 * UNIT);
 
         vm.stopBroadcast();
 
@@ -66,13 +69,14 @@ contract DeployLocal is Script {
         console2.log("AGENT:         ", address(agentToken));
         console2.log("AgentRegistry: ", address(registry));
         console2.log("VenueWhitelist:", address(whitelist));
+        console2.log("VaultImpl:     ", address(implementation));
+        console2.log("VaultFactory:  ", address(factory));
         console2.log("AgentVault:    ", address(vault));
         console2.log("VenueAdapter:  ", address(venue));
         console2.log("");
         console2.log("builder tier:    ", registry.getBuilder(deployer).tier);
         console2.log("AUM ceiling:     ", registry.aumCeiling(deployer) / UNIT);
-        console2.log("vault id:        ", vm.toString(id));
-        console2.log("vault value:     ", vault.totalValue(id) / UNIT);
+        console2.log("vault value:     ", vault.totalValue() / UNIT);
         console2.log("");
         console2.log("Venue is NOT whitelisted: the 2-day timelock has not run on a fresh chain.");
     }
