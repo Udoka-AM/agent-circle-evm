@@ -4,6 +4,7 @@ pragma solidity 0.8.24;
 import { Script, console2 } from "forge-std/Script.sol";
 import { AgentRegistry } from "../src/AgentRegistry.sol";
 import { AgentVault } from "../src/AgentVault.sol";
+import { AgentVaultFactory } from "../src/AgentVaultFactory.sol";
 import { VenueWhitelist } from "../src/VenueWhitelist.sol";
 import { Constants } from "../src/libraries/Constants.sol";
 
@@ -17,7 +18,15 @@ contract Deploy is Script {
 
     uint256 constant UNIT = 1e6;
 
-    function run() external returns (AgentRegistry registry, AgentVault vault, VenueWhitelist wl) {
+    function run()
+        external
+        returns (
+            AgentRegistry registry,
+            AgentVault implementation,
+            AgentVaultFactory factory,
+            VenueWhitelist wl
+        )
+    {
         address quote = vm.envOr("QUOTE_TOKEN", POLYGON_USDC);
         address bondToken = vm.envAddress("BOND_TOKEN");
         address governance = vm.envAddress("GOVERNANCE");
@@ -38,16 +47,20 @@ contract Deploy is Script {
             Constants.DEFAULT_UNBOND_PERIOD
         );
         wl = new VenueWhitelist(governance, guardian, Constants.VENUE_TIMELOCK_DELAY);
-        vault = new AgentVault(quote, address(registry), address(wl), treasury);
+        implementation = new AgentVault(quote, address(registry), address(wl), treasury);
+        factory = new AgentVaultFactory(address(implementation), address(registry));
 
         vm.stopBroadcast();
 
         console2.log("AgentRegistry: ", address(registry));
         console2.log("VenueWhitelist:", address(wl));
-        console2.log("AgentVault:    ", address(vault));
+        console2.log("VaultImpl:     ", address(implementation));
+        console2.log("VaultFactory:  ", address(factory));
         console2.log("");
         console2.log("NOT YET USABLE. Two governance actions remain, both from GOVERNANCE:");
-        console2.log("  1. registry.setVault(%s)  -- one-shot, cannot be changed", address(vault));
+        console2.log(
+            "  1. registry.setVaultFactory(%s)  -- one-shot, cannot be changed", address(factory)
+        );
         console2.log("  2. queue + execute a venue on the whitelist (%s delay)", wl.delay());
         console2.log("");
         console2.log("Deposits will succeed before step 2. Trades will not.");

@@ -30,9 +30,7 @@ interface IVenueAdapter {
     /// call and rejects any result where its balance fell. Returns the quote tokens
     /// actually delivered, which the vault verifies against its own balance rather than
     /// trusting.
-    function exit(address vault, bytes32 vaultId, bytes calldata data)
-        external
-        returns (uint256 proceeds);
+    function exit(address vault, bytes calldata data) external returns (uint256 proceeds);
 
     /// The address that will actually pull quote tokens out of the vault when an order
     /// authorised for this venue settles.
@@ -48,10 +46,14 @@ interface IVenueAdapter {
     /// answer mid-flight would strand allowances it had already been granted.
     function settlementSpender() external view returns (address);
 
-    /// Mark-to-market value of all positions this adapter holds for `vaultId`, in
+    /// Mark-to-market value of all positions this adapter holds for `vault`, in
     /// quote-token units. Cost basis is not acceptable — the position cap and drawdown
     /// checks are only as honest as this number.
-    function positionValue(address vault, bytes32 vaultId) external view returns (uint256);
+    ///
+    /// A vault is its own address, so the address is the whole identity. There used to be
+    /// a `vaultId` alongside it, back when many vaults shared one contract; keeping it
+    /// would only invite an adapter to key on something that no longer means anything.
+    function positionValue(address vault) external view returns (uint256);
 
     function quoteToken() external view returns (address);
 }

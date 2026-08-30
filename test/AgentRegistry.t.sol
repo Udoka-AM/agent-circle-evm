@@ -17,6 +17,7 @@ contract AgentRegistryTest is Test {
     address builder = makeAddr("builder");
     address agent = makeAddr("agent");
     address attacker = makeAddr("attacker");
+    address factoryAddr = makeAddr("vaultFactory");
     address vaultAddr = makeAddr("vault");
     address harmedTraders = makeAddr("harmedTraders");
 
@@ -35,8 +36,13 @@ contract AgentRegistryTest is Test {
             UNBOND
         );
 
-        vm.prank(governance);
-        registry.setVault(vaultAddr);
+        vm.startPrank(governance);
+        registry.setVaultFactory(factoryAddr);
+        vm.stopPrank();
+
+        // The factory vouches for a vault; only vouched-for addresses may move AUM.
+        vm.prank(factoryAddr);
+        registry.registerVault(vaultAddr);
 
         bond.mint(builder, 1_000_000 * UNIT);
         vm.prank(builder);
@@ -246,9 +252,30 @@ contract AgentRegistryTest is Test {
 
     /// A compromised governance key must not be able to point the registry at a
     /// contract that mints headroom out of nothing.
-    function test_vaultIsSetOnce() public {
+    function test_vaultFactoryIsSetOnce() public {
         vm.prank(governance);
         vm.expectRevert(Errors.AlreadySet.selector);
-        registry.setVault(attacker);
+        registry.setVaultFactory(attacker);
+    }
+
+    /// The factory is the only thing that may vouch for a vault. Without this the
+    /// membership set would be as good as open, and moving AUM figures is exactly the
+    /// authority that mints headroom out of nothing.
+    function test_onlyFactoryCanRegisterAVault() public {
+        vm.prank(attacker);
+        vm.expectRevert(Errors.NotVaultFactory.selector);
+        registry.registerVault(attacker);
+
+        vm.prank(governance);
+        vm.expectRevert(Errors.NotVaultFactory.selector);
+        registry.registerVault(attacker);
+
+        assertFalse(registry.isVault(attacker));
+    }
+
+    function test_aVaultCannotBeRegisteredTwice() public {
+        vm.prank(factoryAddr);
+        vm.expectRevert(Errors.AlreadySet.selector);
+        registry.registerVault(vaultAddr);
     }
 }

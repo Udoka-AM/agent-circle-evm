@@ -314,24 +314,29 @@ every pull. An allowance cannot be cached the way a signature answer can.
 preapproved order becomes genuinely unsettleable rather than merely disowned, and the
 claim holds without EIP-1271 being consulted at all.
 
-The mirror is an upper bound rather than an exact figure, for the same reason a
-reservation holds its full worst case: a fill consumes real allowance and the vault
-cannot see it happen, so re-syncing can restore allowance a fill had already spent. It
-is bounded by orders the vault authorised and reserved against, and the exchange's own
-fill accounting stops one order settling twice. Wrong in the safe direction, and wrong
-the same way the reservation is.
+The mirror is exact in amount, now that a vault is its own address: an allowance from a
+vault is an allowance over that vault's balance and nobody else's. It is still coarse in
+time — a fill consumes real allowance and the vault cannot see it happen, so re-syncing
+can restore allowance a fill had already spent. That is bounded by orders this vault
+authorised and reserved against, and the exchange's own fill accounting stops one order
+settling twice.
 
 The ERC-1155 side is the adapter's, not the vault's: outcome tokens live in the adapter,
 and the vault's custody is of quote tokens.
 
-What is still genuinely open is per-vault attribution of an order-book settlement. When
-the exchange pulls from the pooled balance, no vault's `idle` decreases, because the
-vault is not in that transaction. The aggregate stays solvent — every live reservation
-is backed by its own vault's idle — but reconciling a settled fill back to the vault
-that caused it needs a settlement notification. The exchange hardcodes `order.maker` as
-both the source of collateral and the destination for outcome tokens, so a singleton
-vault cannot express whose position is whose — see
-[ADR-0001](docs/adr/0001-vault-topology.md), which proposes per-vault clones.
+Attribution used to be the open problem here: the exchange hardcodes `order.maker` as
+both the source of collateral and the destination for outcome tokens, and a singleton
+vault could not express whose position was whose. That is resolved structurally —
+[ADR-0001](docs/adr/0001-vault-topology.md), now implemented. A vault is its own
+address, so the exchange settles to the vault that traded and positions arrive where
+they belong.
+
+What remains is narrower: an order-book fill still does not call the vault, so `idle`
+does not decrease when the money leaves. The tokens are unambiguously that vault's and
+the allowance bounded what could go, but the vault's own figure drifts from its balance
+until something reconciles them. Since a vault's balance is now genuinely its own, this
+can be a plain reconciliation against `balanceOf` rather than a notification from the
+venue.
 
 ### What is not built, and why
 
@@ -339,8 +344,7 @@ The venue-facing signature entry point. Everything above is the seam it plugs in
 Q1 coming back positive means it is now buildable. The allowance mirroring it needed to
 sit alongside is in place, so this is no longer blocked on anything but the work.
 
-Per-vault attribution of an order-book settlement, described above. The aggregate is
-safe; the bookkeeping is not yet.
+Reconciliation of `idle` after an order-book fill, described above.
 
 `src/adapters/` still does not exist. `IVenueAdapter.execute` remains documented as
 requiring atomicity, and an adapter that merely queues an order does not satisfy it and

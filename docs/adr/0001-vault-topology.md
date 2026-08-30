@@ -1,6 +1,6 @@
 # ADR-0001: Vault topology — singleton versus per-vault clones
 
-**Status:** Proposed
+**Status:** Accepted — implemented 22 August 2026
 **Date:** 21 August 2026
 **Deciders:** Protocol lead; anyone signing off on custody changes before audit
 
@@ -94,7 +94,7 @@ if we ever want one live Polymarket vault before the refactor lands, this is how
 | Dimension | Assessment |
 |---|---|
 | Complexity | Medium-high — touches custody |
-| Cost | +41,257 gas per vault opened, once; ~2.6k per later call |
+| Cost | openVault 105.6k → 181.7k, once per vault; per-call overhead in the noise |
 | Scalability | Good; deploy cost is per vault, with a small per-call proxy overhead |
 | Team familiarity | Medium — standard pattern, new to this codebase |
 
@@ -114,16 +114,13 @@ own allowances, and acting as its own `order.maker`.
   states that parity is deliberate and that where they differ, one of them is wrong.
 
 **Cons:**
-- `openVault` rises from a measured 105,614 gas to roughly 147,000. The clone deploy
-  itself measures 41,257 gas (EIP-1167 via OpenZeppelin `Clones`, measured in this
-  repository rather than estimated). On Polygon this is immaterial in cash terms; it is
-  still a ~40% increase on that one call and should be stated plainly rather than waved
-  away.
-- Every subsequent call pays an extra `DELEGATECALL` through the proxy — about 2,600 gas
-  when the implementation address is cold, which is the common case for a fresh
-  transaction. Against `deposit` at ~173k and `executeTrade` at ~190k that is roughly 1.5%,
-  but it is a permanent per-trade cost rather than a one-off, and it is the honest
-  counterweight to "the deployment cost is per vault, not per trade".
+- `openVault` rises from a measured 105,614 gas to a measured **181,692**. See the
+  postscript: this projection was wrong when the ADR was written, and the correction is
+  worth reading before quoting the figure.
+- Every subsequent call pays an extra `DELEGATECALL` through the proxy. This turned out to
+  be in the measurement noise: `deposit` went 173.6k → 171.2k and `executeTrade` 205.6k →
+  204.2k, both slightly *down*, because dropping the `bytes32 id` argument and its mapping
+  lookups paid for the proxy hop. The per-trade cost of clones is, in practice, nil.
 - `AgentRegistry` currently authenticates a single `vault` address (`msg.sender != vault`
   → `NotVault`). With clones it must instead verify that the caller is a clone the factory
   deployed. That is a new trust edge: governance trusts a factory, and the factory attests
@@ -194,13 +191,41 @@ custody model afterwards wastes the audit.
 1. [ ] Confirm on Amoy that a contract can act as `order.maker` end to end — sign under
        `POLY_1271`, get matched by an operator, receive outcome tokens. This ADR rests on
        reading their code; one live trade is worth more than the reading.
-2. [ ] Decide registry authentication: factory-attested clones versus a registry-held
-       allowlist the factory writes to.
-3. [ ] Convert `AgentVault` to an initialisable implementation plus `AgentVaultFactory`.
-4. [ ] Move `AgentRegistry.setVault` to the factory-provenance check.
-5. [ ] Port the isolation test: it currently proves the singleton keeps vaults separate, and
-       should become a test that clones cannot touch each other's balances.
-6. [ ] Make the allowance mirror exact once it is per-vault, and drop the upper-bound
-       caveat from README §4 and `details.md`.
-7. [ ] Re-measure `openVault` end to end after the refactor and check it against the
-       ~147k projection built from the measured 41,257 gas clone cost.
+2. [x] Registry authentication: governance sets one factory; the factory calls
+       `registerVault` for each clone it deploys, and nothing else can. Chosen over
+       CREATE2 re-derivation in the registry, which would have needed the registry to
+       know the trader as well as the listing on every AUM call.
+3. [x] `AgentVault` is an initialisable implementation; `AgentVaultFactory` clones it
+       deterministically at `keccak256(trader, listingId)`.
+4. [x] `setVault` is now `setVaultFactory`, and `notifyAumDelta` checks the `isVault`
+       set rather than a single address.
+5. [x] `test_vaultsAreIsolated` now asserts two addresses holding their own balances,
+       and `CrossVaultIsolation.t.sol` asserts an allowance cannot reach another vault.
+6. [x] The mirror is per-vault and therefore exact; the upper-bound caveat is gone.
+7. [x] Measured at 181,692. See the postscript.
+
+
+---
+
+## Postscript: what the estimate got wrong (22 August 2026)
+
+The ADR projected `openVault` at ~147,000 gas: the measured 105,614 for the old call plus
+the measured 41,257 for an EIP-1167 clone. The implemented figure is **181,692**, about 35k
+higher. Both inputs were measured correctly; the arithmetic missed the work that only
+appears once the pieces are joined up.
+
+The gap is almost entirely the registry attestation this ADR itself called for. Writing
+`isVault[vault] = true` is a cold `SSTORE` at 20,000, the cross-contract call to a cold
+address adds 2,600, and the `VaultRegistered` event another ~1,900 — around 24.5k that the
+"deploy cost" framing quietly left out. The rest is the CREATE2 salt hashing, the existence
+check, and the `initialize` call.
+
+One cost in the first implementation was avoidable and has been removed. The factory kept a
+`vaultFor` mapping from `(trader, listing)` to address, which is ~20k to write down
+something CREATE2 already determines. Existence is now an `EXTCODESIZE` on the predicted
+address, at 2,600. That took `openVault` from 200,920 to 181,692.
+
+The decision does not change — 76k of one-off gas on Polygon is still immaterial against
+being able to attribute a position at all, and the per-call overhead turned out to be nil.
+But an estimate assembled from two correct measurements was still 24% low, and the reason
+was a line item this very document listed under Cons without pricing.
